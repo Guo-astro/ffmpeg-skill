@@ -4,8 +4,15 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.4.0
+
+_Automated release: version and notes generated from pull requests merged since 2.3.2._
+
 - feat(join): each `silent` entry carries `at`/`end`, where that input sits in the output (seconds, transition overlap included), and `--allow-silent N[,N]` (1-based) marks a planned pause: always joined, listed with `intended: true`, no warning or note, whatever `--on-silent` says.
 (nothing yet)
+- feat(join): silent entries carry at/end; --allow-silent marks a planned pause (#300)
 
 ## 2.3.2
 
