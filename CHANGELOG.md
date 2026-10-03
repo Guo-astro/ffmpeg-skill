@@ -4,7 +4,15 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.4.1
+
+_Automated release: version and notes generated from pull requests merged since 2.4.0._
+
 - fix(join): a plain cut (`--transition none`) no longer leaves a hole in the video where a clip's sound runs past its picture. The concat filter starts each clip after the *longer* stream of the one before, so a music bed padded to the container left 0.3 s of missing video (an odd average rate downstream), and even a 20 ms AAC tail left a one-frame gap; the run succeeded with `verified` false. Every clip now gets the crossfade path's one length for both streams: the last frame held when the sound runs more than a frame past the picture, the sound trimmed when it runs less. `expected_duration` counts those lengths, not container durations.
+- fix(join): a plain cut leaves no hole where a clip's sound outruns its picture (#302)
+- chore(deps): Bump github/codeql-action from 3 to 4 (#307)
 
 ## 2.4.0
 
