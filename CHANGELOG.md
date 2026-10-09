@@ -4,12 +4,19 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.7.0
+
+_Automated release: version and notes generated from pull requests merged since 2.6.0._
+
 - feat: Parakeet speech engines, built by [@rymalia](https://github.com/rymalia) in #305. `parakeet-mlx` and `parakeet.cpp` (`parakeet-cli` + a `.gguf`) for `caption.py --transcribe` and `silence.py --filler --transcribe`; `--engine` / `FFMPEG_SKILL_ASR_ENGINE` pick one, and a named engine runs as asked. `auto` runs Parakeet for English speech (an English `--language`, else whisper.cpp's language detector) and Whisper otherwise. Speech whose language nobody named and nothing here could detect goes to a Whisper engine that can run; Parakeet runs on English assumed only when there is none or every one failed, and the result's top-level `notes` then says the transcript is wrong if the speech is not English (new for `silence.py`). Results carry `transcription` (engine, model, language, routing) in every caption `--mode`; `silence.py`'s `filler.source` is `parakeet:ENGINE` for them. A Parakeet engine whose output is not a readable transcript is a failed run and the next engine is tried; its own empty answer is the `no_speech` refusal. `transcribe_result()` / `transcribe_words_result()` return what a call used as a `Transcription`, and `transcribe()` / `transcribe_words()` keep their return shapes. New optional contract capability `external:parakeet`.
 - fix: whisper.cpp is told to detect the language (`-l auto`) when `--language` / `--filler-lang` is not given. It was given no `-l`, and its own default is English, so `caption.py --transcribe` and `silence.py --filler --transcribe` decoded speech in any other language as English. The result's `transcription.language` stays `null` for a language the engine identified itself.
 - fix: the "no local speech-to-text engine found" refusal, with its install lines, now only means no engine was found. A whisper.cpp that was installed but failed, with nothing after it, got that refusal; now the refusal names each engine that was found and why it did not transcribe (`kind: input`, `reason: "engine_failed"` or `"english_only"`, `engines[].detail` with the engine's own error line).
 - fix: a faster-whisper that raises while loading or running its model (an offline first run, a broken install) is a failed engine: `caption.py --transcribe` logs "faster-whisper found but failed" and tries the next engine instead of refusing with "faster-whisper found no speech", and `silence.py --filler --transcribe` can fall back to Parakeet. The exception used to be swallowed in the engine's thread. An engine that ran and found no segment is still the `no_speech` refusal.
 - docs: parakeet-mlx downloads its default model (`mlx-community/parakeet-tdt-0.6b-v2`) from Hugging Face on first use, as faster-whisper does, and openai-whisper downloads its model from OpenAI. The install hint, README, docs/contract.md and references/scripts.md now say so, and that the audio never leaves the machine (inference is local). The skill's own code opens no connection, but faster-whisper runs inside the skill's process, so its first-run download is made from that process. The refusal's "all run offline" is gone: a first run that downloads is not offline.
 - feat(contract): `execution.model_downloads` says which speech engine fetches its model on first use, from where, and in which process (faster-whisper in the skill's own; parakeet-mlx and openai-whisper in their own child processes; whisper.cpp and parakeet.cpp never). `execution.network: false` keeps its meaning, the skill's own code, and no longer reads as a promise that a first `--transcribe` is network-free.
+- feat: Parakeet speech engines for --transcribe (#312)
 
 ## 2.6.0
 
