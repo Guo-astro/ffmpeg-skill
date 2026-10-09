@@ -56,24 +56,91 @@ between tools.
 ```
 probe.py INPUT... [--compact] [--field duration|video.fps|...]
 ```
-JSON with `duration`, `video{codec,width,height,fps,pix_fmt,color_space,rotation,variable_frame_rate_suspected,hdr,hdr_signal,bt2020_or_hdr,hdr_format}`
+JSON with `duration`, `video{codec,width,height,fps,pix_fmt,color_space,rotation,variable_frame_rate_suspected,hdr,hdr_signal,bt2020_or_hdr,hdr_format,start_time}`
 (`hdr`, and `hdr_signal` equal to it, is true only for a PQ / HLG transfer or Dolby Vision -- since 2.0;
 `bt2020_or_hdr` also counts BT.2020 primaries on an SDR transfer, which `hdr_format` names "BT.2020 SDR"),
-`audio{codec,channels,sample_rate}`. `--compact` gives one line per file.
+`audio{codec,channels,sample_rate,start_time}` (`start_time`: where the stream starts on the file's
+own clock, `null` when unknown). `--compact` gives one line per file.
 
 ### cut.py — cut / join segments
 ```
-cut.py INPUT [--start T] [--end T | --duration T] [--segments A-B,C-D,...] [--accurate] [-o OUT]
+cut.py INPUT [--start T] [--end T | --duration T] [--segments A-B,C-D,...] [--accurate] [--edit-list] [--keep-hevc] [--vfr-guard average|sampled|off] [-o OUT]
 cut.py INPUT --start T --end T --snap beats [--snap-tolerance 0.12] [--snap-source FILE] [--min-confidence 0.5]
 ```
 Times accept `12.5`, `1:30`, `00:01:30.250`. Default is `-c copy` (snaps to
 keyframes, instant, lossless); if the snapped result deviates more than
 `--tolerance` (0.5 s) from the request, that segment is re-encoded automatically
-(x264 CRF 18). `--accurate` always re-encodes; `--tolerance -1` never does.
+(CRF 18: x264, or x265 Main10 with the source's own tags for an HDR or BT.2020 source;
+`--keep-hevc` re-encodes an SDR HEVC source (not BT.2020: that keeps its Main10 line and colour tags) as x265 8-bit BT.709, on VideoToolbox under `--hw`;
+`--codec` overrides all of them). `--accurate` always re-encodes; `--tolerance -1` never does for a keyframe snap
+(a `--segments` join of open-GOP video, one whose later B-frame `.mp4`/`.mov` segment starts
+between keyframes, or one that fails its check, still re-cuts).
 Multiple segments are concatenated in the order given. stderr reports whether
 the result was "lossless stream copy" or "re-encoded"; when the snap forced a
 re-encode, the result's `lossless_alternative` names the nearest keyframe
 `--start` that would stream-copy instead, so the trade can be offered.
+A single `.mp4`/`.mov` stream copy shifts its timestamps to zero
+(`-avoid_negative_ts make_zero`), so the picture starts at the keyframe.
+`--edit-list` keeps its MP4 edit list instead, so the picture starts at
+`--start`: `edit_list` and `stored_preroll_seconds` say so, `notes` warns that a
+player which ignores edit lists shows the pre-roll, and the copy's length is
+judged by its video (a copy that starts where asked but ends past `--tolerance`
+re-encodes without offering another `--start`). `av_start_skew_seconds` is
+audio start minus video start; a stream copy gets a note when it is more than
+max(2 frames, 0.1 s) away from the source's own offset where the picture starts
+(the keyframe the copy began from; `--start` under `--edit-list`). It is
+reported, not repaired. `-ss`/`-t` are passed to the microsecond; `--accurate`
+seeks a second early and trims on the output side, so frames just before a
+keyframe are kept. `keyframe_snapped` is true for every stream copy (`precision`
+`packet`); `start_snapped` is measured: true when a copied picture starts more
+than a frame from `--start`, or when its start could not be measured (an unknown start is
+never claimed exact); `null` under `--dry-run`.
+`reencode_reason` lists every cause of a re-encode (`requested`, `codec`, `vfr`,
+`vfr_inconclusive`, `pcm_container`, `copy_failed`, `tolerance`, `concat_fallback`);
+`--segments` adds `segment_precision`, and `least_exact_precision` is the least exact one.
+A `--segments` video copy join adds `join_check` (`packets`, `expected_packets`,
+`max_step_seconds`, `audio_offset_ms` per part, `audio_parts_checked`, `ok`: the
+written file measured against the source) and `segment_end_snap_seconds` (where
+each part's end moved to its keyframe).
+
+**VFR guard (`--vfr-guard`).** `average` (default): a source whose nominal and
+average frame rates differ (`variable_frame_rate_suspected`) re-encodes as
+`--accurate` (reason `vfr`), and `cut.py` then samples its packet timestamps (up
+to five 6 s windows; no decoding) into `vfr_check` (`measured`: `sampled_cfr`,
+`vfr` or `inconclusive`, plus `guard`); a `sampled_cfr` there adds a note naming
+`--vfr-guard sampled`. `sampled` samples before every copy and re-encodes only on
+`vfr` / `inconclusive` (reasons `vfr` / `vfr_inconclusive`), so a phone clip at
+29.98 against a nominal 30 copies; `off` samples and keeps the copy with a note.
+Irregular timing between the windows is not seen; `--accurate` is always available.
+
+A source with no B-frames (iPhone "Most Compatible" H.264) cuts its parts as
+every 2.x release did: from the keyframe at (or before) each start to the end
+asked for, each part within `--tolerance`. On B-frame video a copied
+`.mp4`/`.mov` part runs from the keyframe at (or before) its start to the first
+keyframe at or after its end (never an earlier one), each end within
+`--tolerance`, so the join is the source's own frames with no gaps; a later
+segment that starts between keyframes there is re-cut (its hidden pre-roll
+cannot cross a join). A source with **open GOPs** (x265's default, iPhone "High
+Efficiency" HEVC) cannot be copied exactly across a join and is re-cut
+(`concat_fallback`, named in `notes`). Every copy join is measured after it is
+written (`join_check`): the frame count, each step at a join against the step
+its parts predict, and each part's sound against its picture (audio packets
+matched to the source; more than 5 ms off fails, a part with no unique match
+is unmeasured). One that fails is re-cut. Only windows around the segments
+(about 10 s each side, widened as needed) are read from the source, so a long
+source costs what its segments do.
+The parts are joined by stream copy only when they all copied and match: the
+same streams with the same codec parameters, rotation, colour tags and
+extradata. Otherwise every segment is **re-cut from
+the source** into one re-encode (`concat_fallback`): frame-exact boundaries, the
+audio's offset from the video kept, subtitles dropped and reported, and at most
+32 segments per ffmpeg call. A segment shorter than one video frame is refused.
+With `--accurate` the segments are always cut that way, in one encode (a part
+encoded on its own ran an AAC frame past its picture, leaving a hole at every
+join). A segment other than the last that runs past the end of the video is
+ended with the video when it runs less than a frame past it, and otherwise keeps
+its sound with the last frame held -- which forces the re-cut (`concat_fallback`,
+named in `notes`). The last segment keeps the source's own sound-only tail.
 
 **`--snap beats` (1.17)** moves each in/out point to the nearest *measured*
 beat within `--snap-tolerance` seconds (default 0.12, about a quarter of a beat
@@ -905,6 +972,13 @@ batch.py FOLDER --recipe batch.json [--force] [--watch SECONDS] [--jobs N|auto] 
 placeholders, chained) or `project` (a render project applied per file).
 Outputs land in `output_dir` with `suffix`; a content-hash cache skips files
 already done with the same recipe. Use `--dry-run` to preview the plan.
+A recipe that runs `cut.py` rolls its calls up: each of those `results` rows carries
+`cut_reencoded` (each call's `reencoded`) and `cut_reencode_reasons` (each
+`reencode_reason` its calls named, once per call),
+and the top level `cut_stream_copy` (`{calls, stream_copy, reencoded,
+stream_copy_rate}`) and `cut_reencode_reasons` (counts per reason; `unknown` for a
+re-encoded call cached by an earlier 2.x batch); both are `null`
+when no `cut.py` step ran.
 
 **`--jobs N` (1.17)** processes N files at once (threads: the work is
 subprocess waiting). Capped at `min(N, cpu_count, 8)` — every item is itself an

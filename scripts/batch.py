@@ -173,6 +173,7 @@ def process(src: Path, recipe: Dict[str, Any], outdir: Path, work: Path,
         ok, _doc = run_step(["render.py", str(pj)], budget())
         step_docs = [("render", _doc)]
         cut_reencoded: List[bool] = []
+        cut_reasons: List[str] = []
     else:
         steps = recipe.get("steps") or []
         if not steps:
@@ -181,18 +182,20 @@ def process(src: Path, recipe: Dict[str, Any], outdir: Path, work: Path,
         ok = True
         cut_reencoded = []
         step_docs = []
+        cut_reasons = []
         for i, step in enumerate(steps):
             last = i == len(steps) - 1
             out = str(final) if last else str(work / f"{src.stem}_step{i}.{'mp4' if src.suffix.lower() not in ('.wav', '.mp3', '.m4a', '.flac') else src.suffix.lstrip('.')}")
             argv = [str(a).replace("{in}", cur).replace("{out}", out) for a in step]
             step_ok, doc = run_step(argv, budget())
             step_docs.append((Path(str(argv[0])).stem if argv else "step", doc))
-            # only cut.py's own doc carries `reencoded` -- true if ANY range this call cut needed
-            # the tolerance-triggered hybrid re-encode fallback (cut.py ORs its per-segment results
-            # into one top-level field; it doesn't report which range, so this is per cut.py call,
-            # not per --segments range).
+            # only cut.py's own doc carries `reencoded` -- true if ANY range this call cut (or its
+            # --segments join) re-encoded, for the reasons in its `reencode_reason` (distinct per
+            # call, so cut_reencode_reasons lists each reason once per cut.py call that named it).
+            # Per cut.py call, not per --segments range.
             if step_ok and argv and argv[0] == "cut.py" and isinstance(doc, dict) and "reencoded" in doc:
                 cut_reencoded.append(bool(doc["reencoded"]))
+                cut_reasons.extend(r for r in (doc.get("reencode_reason") or []) if isinstance(r, str))
             if not step_ok:
                 ok = False
                 break
@@ -200,6 +203,7 @@ def process(src: Path, recipe: Dict[str, Any], outdir: Path, work: Path,
     result: Dict[str, Any] = {"file": str(src), "output": str(final), "ok": ok, "seconds": round(time.time() - t0, 1)}
     if cut_reencoded:
         result["cut_reencoded"] = cut_reencoded
+        result["cut_reencode_reasons"] = cut_reasons
     # the encoder each item really ran and its GPU facts (--hw / FFMPEG_SKILL_HW: on VideoToolbox,
     # fell back and why): this process encodes nothing itself, so its top-level hw.used is null
     result.update(steps_encoder_report(step_docs))
@@ -563,23 +567,36 @@ def main() -> int:
         die(f"{len(results) - done} of {len(results)} items failed: {', '.join(failed_files[:5])}" + (" ..." if len(failed_files) > 5 else ""),
             kind="verification", output=None, dry_run=STATE.dry_run, results=results, processed=done, total=len(results))
     # cut.py's own `reencoded`, rolled up across every cut.py step this batch ran: how much of the
-    # folder landed on the fast lossless path (mode "copy") vs fell back to the tolerance-triggered
-    # hybrid re-encode on at least one range -- purely a function of the sources' keyframe placement
-    # relative to each cut point, not something a single run can predict, so it's worth reporting
-    # after the fact rather than not at all. Per cut.py call, not per --segments range: cut.py ORs
-    # its own per-segment results into one top-level field and doesn't say which range needed it.
+    # folder landed on the fast lossless path (mode "copy") vs re-encoded on at least one range.
+    # Keyframe placement, VFR sources, --accurate/--codec in the recipe and --segments joins all
+    # cause it, so the summary counts cut.py's own `reencode_reason` values rather than guessing
+    # one cause. Per cut.py call, not per --segments range.
     all_cuts = [r for res in results for r in (res.get("cut_reencoded") or [])]
     cut_summary = None
+    # how many cut.py calls named each reason, beside cut_stream_copy (whose shape is 2.x's,
+    # unchanged); null when no cut.py step ran
+    reasons: Optional[Dict[str, int]] = None
     if all_cuts:
         copied = sum(1 for r in all_cuts if not r)
         cut_summary = {"calls": len(all_cuts), "stream_copy": copied, "reencoded": len(all_cuts) - copied,
                         "stream_copy_rate": round(copied / len(all_cuts), 3)}
+        reasons = {}
+        for res in results:
+            if "cut_reencode_reasons" not in res:
+                # a row from a cache an earlier 2.x batch wrote: it says which calls re-encoded,
+                # not why, so they count as "unknown" rather than leaving {} ("none re-encoded")
+                unknown = sum(1 for r in res.get("cut_reencoded") or [] if r)
+                if unknown:
+                    reasons["unknown"] = reasons.get("unknown", 0) + unknown
+            for r in res.get("cut_reencode_reasons") or []:
+                reasons[r] = reasons.get(r, 0) + 1
+        why = (" (reencode_reason: " + ", ".join(f"{k} x{v}" for k, v in reasons.items()) + ")") if reasons else ""
         info(f"cut.py: {copied}/{len(all_cuts)} call(s) stayed fully lossless stream-copy "
-             f"({cut_summary['stream_copy_rate']:.0%}), {len(all_cuts) - copied} fell back to hybrid re-encode on at least one range")
+             f"({cut_summary['stream_copy_rate']:.0%}), {len(all_cuts) - copied} re-encoded a range or its --segments join{why}")
     emit(None, results=results, processed=done, total=len(results),
          jobs=jobs, jobs_requested=requested, wall_seconds=round(time.time() - started, 1),
          item_seconds_total=round(sum(float(r.get("seconds") or 0) for r in results), 1),
-         timed_out=timed_out["hit"], cut_stream_copy=cut_summary)
+         timed_out=timed_out["hit"], cut_stream_copy=cut_summary, cut_reencode_reasons=reasons)
     return 0
 
 

@@ -2199,6 +2199,18 @@ class ContractTests(unittest.TestCase):
         doc = json.loads(tool("cut", self.src, "--start", "0", "--end", "2", "--json", "-o", self.out("e6_cut0.mp4")).stdout)
         self.assertIsNone(doc["lossless_alternative"])
 
+    def test_cut_names_the_lossless_alternative_in_matroska_and_mp4_keeps_its_edit_list(self):
+        """.mkv has no edit list, so the copy snaps back to the keyframe at 0 and the lossless
+        alternative is offered; an .mp4 copy that keeps its edit list (--edit-list) starts at 2 s
+        losslessly."""
+        doc = json.loads(tool("cut", self.src, "--start", "2", "--end", "4", "--fast", "--json", "-o", self.out("e6_cut.mkv")).stdout)
+        self.assertEqual(doc["mode"], "hybrid")
+        self.assertIn("--start 0.000", doc["lossless_alternative"])
+        doc = json.loads(tool("cut", self.src, "--start", "2", "--end", "4", "--fast", "--edit-list", "--json",
+                              "-o", self.out("e6_cut_el.mp4")).stdout)
+        self.assertEqual(doc["mode"], "copy")
+        self.assertTrue(doc["edit_list"])
+
     def test_verified_reports_what_the_tool_measured(self):
         """#189 C: every success document carries `verified` and `verification`. cut: probe only;
         loudness: probe + its own after-write measurement; export on a raw source: loudness step

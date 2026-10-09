@@ -7,7 +7,7 @@ description: 'Edit video and audio with local FFmpeg from natural-language reque
 
 Scripts live in `scripts/` next to this file; run them with `python3 <skill-dir>/scripts/<name>.py`, and delivery templates in `templates/`. This file is enough to do a job: the table below routes the request, and `--help` on the script about to run is the cheapest full flag list. A reference file costs as much as this one; open one only for a question you have: `references/scripts.md` (every flag of all 42 scripts), `references/devices.md` (iPhone HDR, GoPro, DJI, screen recordings, Zoom), `references/gotchas.md` (the long form of the one-line rules at the end). MCP: `tools/list` shows only the core 12 by default; the other 30 (per this table) stay callable by name via `tools/call`, described by `contract --json`; set `FFMPEG_SKILL_MCP_FULL=1` for all 42.
 
-Shared flags (every script): `--dry-run`; `--json` (output path, its probe, the commands run); `--json-brief` (status/output/verified + a `summary`; prefer on writing steps); `--fast` (preview quality); `--progress` (percent/ETA); `--timeout SECONDS` (`kind: timeout`, default 1800); `--overwrite` (step 7); `--plan FILE` (a dry run `render.py FILE` runs later; refuses if an input changed). Re-encoding tools also take `--hw` (Apple Silicon GPU, big files; `FFMPEG_SKILL_HW=1` = default, not export), `--codec h264|hevc|av1|prores` and `--quality N`: unset, SDR is x264, HDR is x265 Main10; `prores` needs `-o NAME.mov`, `h264` refuses HDR (`color.py --to-sdr` first).
+Shared flags (every script): `--dry-run`; `--json` (output path, its probe, the commands run); `--json-brief` (status/output/verified + a `summary`; prefer on writing steps); `--fast` (preview quality); `--progress` (percent/ETA); `--timeout SECONDS` (`kind: timeout`, default 1800); `--overwrite` (step 7); `--plan FILE` (a dry run `render.py FILE` runs later; refuses if an input changed). Re-encoding tools also take `--hw` (Apple Silicon GPU, big files; `FFMPEG_SKILL_HW=1` = default, not export), `--codec h264|hevc|av1|prores` and `--quality N`: unset, SDR is x264 (`cut.py --keep-hevc`: HEVC source stays HEVC), HDR is x265 Main10; `prores` needs `-o NAME.mov`, `h264` refuses HDR (`color.py --to-sdr` first).
 
 Writing tools run nothing under `--dry-run`; the measuring tools (`probe`, `check`, `sync`, `multicam`, `scenes`, `cropdetect`, `report`, `silence`, `loudness`, `stabilize`) may still run ffmpeg/ffprobe, skipping artifacts/side files (`--edl`, `--sheet`, a generated `.ass`); `verify` ignores the flag. Per tool: `contract --json` `dry_run`.
 
@@ -52,7 +52,7 @@ This skill cuts, joins, measures, syncs, exports and checks files — it execute
 
 The line: same input + same explicit parameters always producing the same verifiable output belongs here; anything depending on taste, understanding or what looks or sounds good belongs to whoever makes that judgement.
 
-If a request needs an FFmpeg feature none of the 42 scripts expose, say so and name the closest built-in option — never guess a raw `ffmpeg`/`ffprobe` invocation outside `scripts/*.py`. It bypasses every guarantee this skill makes, so never a fallback when a script's flag doesn't cover something.
+If a request needs an FFmpeg feature none of the 42 scripts expose, say so and name the closest built-in option — never guess a raw `ffmpeg`/`ffprobe` invocation outside `scripts/*.py`. It bypasses every guarantee this skill makes, so it is never a fallback.
 
 ## Request → script
 
@@ -65,7 +65,7 @@ Timestamp flags (`--start`, `--end`, `--at`, `--from`, `--duration`, `--offset`,
 | "cut from 1:20 to 2:05", "trim the first 10 s" | `cut.py input.mp4 --start 1:20 --end 2:05` |
 | "keep only these parts", "remove the middle" | `cut.py input.mp4 --segments 0-1:00,1:30-2:00` |
 | "make it exactly 60 seconds" | `fit.py input.mp4 --duration 60` (speed) or `--method trim` |
-| "cut this and make it HEVC / AV1 / ProRes" (output codec named) | `cut.py input.mp4 --start 0:10 --end 0:40 --codec hevc` (`--codec`/`--quality` on any re-encoding tool; ProRes needs `-o NAME.mov`) |
+| "cut this and make it HEVC / AV1 / ProRes" (output codec named) | `cut.py input.mp4 --start 0:10 --end 0:40 --codec hevc` (ProRes needs `-o NAME.mov`) |
 | "cut out the pauses", "jump cuts" | `silence.py input.mp4 [--threshold -40 --min-silence 0.8]` |
 | "cut the ums and uhs", "remove the filler words" | `silence.py input.mp4 --filler --words words.json` (measured word timings; `--transcribe` makes them) |
 | "don't cut inside a sentence, just the real pauses" | `silence.py input.mp4 --speech-aware` — a breath under `--min-silence` inside a sentence is kept, only sentence-boundary pauses cut; composes with `--filler` into one list |
@@ -206,8 +206,8 @@ One line each; open the linked `references/gotchas.md` section when the job is i
 
 - HDR (iPhone, HDR10) re-encoded through an SDR path goes flat; the scripts keep HDR; `hdr: true` is a real PQ/HLG/DV signal, `bt2020_or_hdr: true` also BT.2020 SDR. -> [#hdr-and-colour](references/gotchas.md#hdr-and-colour)
 - Log footage (S-Log/V-Log/C-Log) is tagged SDR and looks grey: `probe.py --analyze`, then `color.py --lut` first. -> [#log-footage](references/gotchas.md#log-footage)
-- A `-c copy` cut can start on a wrong or frozen frame; `cut.py` re-encodes past a 0.5 s snap, respect it. -> [#keyframe-cuts](references/gotchas.md#keyframe-cuts)
-- VFR phone/screen recordings: re-encodes conform to CFR, `cut.py` switches to `--accurate`; pick the rate with `fit.py --fps` when odd. -> [#variable-frame-rate](references/gotchas.md#variable-frame-rate)
+- A `-c copy` cut can start on a wrong/frozen frame; `cut.py` re-encodes past a 0.5 s snap, respect it; `--edit-list` hides an .mp4's pre-roll. -> [#keyframe-cuts](references/gotchas.md#keyframe-cuts)
+- VFR phone/screen clips: re-encodes go CFR; `cut.py` re-encodes (`--vfr-guard sampled`: only measured VFR); odd rate: `fit.py --fps`. -> [#variable-frame-rate](references/gotchas.md#variable-frame-rate)
 - Sync/multicam `confidence` under 0.3 (or a huge offset) is suspect — check every camera; these align audio, never lip sync. -> [#sync-multicam-and-drift](references/gotchas.md#sync-multicam-and-drift)
 - "Normalised" audio can still clip (check true peak); ambience at -40 LUFS or below must never be raised to a speech target. -> [#loudness-and-ambience](references/gotchas.md#loudness-and-ambience)
 - Captions burned before a crop/resize land off-frame; burned small then upscaled by `export.py` come out soft. -> [#captions-fonts-and-text-order](references/gotchas.md#captions-fonts-and-text-order)
