@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.20.0
+
+_Automated release: version and notes generated from pull requests merged since 2.19.0._
+
 ### Added
 
 - **`join.py` reports the clips' own total beside the joined length.** The expected length a join is checked against comes from the transition the join applied, so a fade that took time out of the material passed unseen. 15 s of clips joined with the default fade play as 14 s. `inputs_duration` and `transition_shortening` now sit next to `expected_duration`, the duration step carries `inputs_total`, and `notes` says when the transitions shortened the join.
@@ -13,6 +19,7 @@
 
 - **`loudness.py` no longer lengthens the sound.** Through the AAC encoder its output ran longer than the input: 0.015 s on a 6 s clip, 0.1 s on a 90 s one. The sound is trimmed to the input's length, and a `duration` step measures it.
 - **`export.py` measures the length its preset promises.** It trimmed to the platform maximum but never re-read what it wrote. With `--normalize`, a Reels export left at 90.10 s by the loudness pass came back `verified: true`, and `check.py` failed the same file. A `duration` step now holds the written file to the same limit `check.py` uses.
+- Lengths and silences are checked against a yardstick the tool did not make (#372)
 
 ## 2.19.0
 
