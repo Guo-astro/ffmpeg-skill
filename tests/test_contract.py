@@ -3776,6 +3776,48 @@ class ContractTests(unittest.TestCase):
         self.assertAlmostEqual(doc["silence_breakdown"]["digital"]["seconds"], 1.0, delta=0.1)
         self.assertAlmostEqual(doc["silence_breakdown"]["below_threshold"]["seconds"], 1.0, delta=0.1)
 
+    def test_the_thresholds_table_matches_the_code(self):
+        """references/scripts.md restates every verdict threshold (2.21). Each row names the constant
+        or flag it comes from, and its value must be that constant's or that flag's default; the
+        per-platform table must be _platforms.PLATFORMS, row for row."""
+        import importlib, re
+        text = (ROOT / "references" / "scripts.md").read_text(encoding="utf-8")
+        block = text.split("<!-- thresholds:start -->", 1)[1].split("<!-- thresholds:end -->", 1)[0]
+        rows = [r for r in block.strip().splitlines()[2:] if r.startswith("|")]
+        # every threshold: a row deleted (or added) must be a deliberate edit here too
+        self.assertEqual(len(rows), 26)
+        for row in rows:
+            what, value, source, _used = [c.strip() for c in row.strip("|").split("|")]
+            number = float(re.search(r"-?\d+(?:\.\d+)?", value).group(0))
+            src = source.strip("`")
+            if ".py --" in src:
+                tool_name, flag = src.split(".py ", 1)
+                props = self.tools[tool_name]["input_schema"]["properties"]
+                prop = next(p for p in props.values() if flag in (p.get("cli") or []))
+                actual = prop["default"]
+            else:
+                module, _, name = src.rpartition(".")
+                actual = getattr(importlib.import_module(module), name)
+            if isinstance(actual, str):  # an ffmpeg option value such as "-60dB"
+                actual = re.search(r"-?\d+(?:\.\d+)?", actual).group(0)
+            self.assertAlmostEqual(float(actual), number, places=6, msg=f"{what}: table says {value}, {src} is {actual}")
+        # the silent-track row says join, audio and waveform default to it: hold them to that
+        from _common.probe import SILENT_PEAK_DBFS
+        for name in ("join", "audio", "waveform"):
+            props = self.tools[name]["input_schema"]["properties"]
+            prop = next(p for p in props.values() if "--silence-threshold" in (p.get("cli") or []))
+            self.assertAlmostEqual(prop["default"], SILENT_PEAK_DBFS, places=6, msg=name)
+        import _platforms
+        block = text.split("<!-- platforms:start -->", 1)[1].split("<!-- platforms:end -->", 1)[0]
+        table = [r for r in block.strip().splitlines()[2:] if r.startswith("|")]
+        want = []
+        for key, entry in _platforms.PLATFORMS.items():
+            spec = entry["spec"]
+            lufs = "—" if spec.get("lufs") is None else f"{spec['lufs']:g} LUFS"
+            longest = "—" if spec.get("max_duration") is None else f"{spec['max_duration']:g} s"
+            want.append(f"| `{key}` | {lufs} | ±{spec['lufs_tol']:g} LU | {spec['tp']:g} dBTP | {longest} |")
+        self.assertEqual(table, want)
+
     def test_unverified_range_names_real_tools_and_reaches_the_contract(self):
         from _common.emit import UNVERIFIED
         self.assertLessEqual(set(UNVERIFIED), set(self.tools))

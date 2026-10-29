@@ -4,7 +4,13 @@
 
 ## Unreleased
 
-(nothing yet)
+### Added
+
+- **One table of verdict thresholds.** `references/scripts.md` § "Verdict thresholds" lists the numbers behind `verified` and `check.py`'s rows: true-peak and loudness tolerances, the length tolerances of `loudness.py` and `join.py`, `cut.py`'s keyframe tolerance, the silence, digital-silence and dropout levels, `--content`'s shares and filler timings. It also gives each platform's loudness target, tolerance, true-peak ceiling and maximum length. Before, these numbers were split across the code, docs/contract.md and docs/design-decisions.md, and some were in no doc at all. Each row names the constant or flag it comes from, and a test holds the table to the code.
+
+### Changed
+
+- **The -50 dBFS silent-track level is one constant.** `join.py`, `audio.py` and `waveform.py` took their `--silence-threshold` default from a literal; it is now `_common.probe.SILENT_PEAK_DBFS`, the level `check.py` already used. `loudness.py`'s ±1.0 LU and `join.py`'s duration tolerance are named constants too. No value changed.
 
 ## 2.20.0
 
