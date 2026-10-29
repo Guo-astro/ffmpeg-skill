@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.17.4
+
+_Automated release: version and notes generated from pull requests merged since 2.17.3._
+
 ### Fixed
 
 - **A font file in a folder with a non-ASCII name draws on Windows.** drawtext hands `fontfile=` to FreeType, which opens it with the ANSI `fopen` on Windows. A `--font-file` (or a brand's `font_file`) under a folder such as `フォント` or `compat dir ünïcode` failed to load, and `overlay.py`, `graphics.py` and `grid.py` died with "could not parse fontconfig pattern". Measured on the gyan.dev 9.0.2 runner: the same font under an ASCII folder loaded, spaces included. Such a path is now given in its 8.3 short form, or copied into the run's private drawtext folder under an ASCII name when the drive keeps no short names (`font_path_copied`). Found when the Windows tests first ran in parallel.
@@ -24,6 +30,7 @@
 ### Tests
 
 - **`npm test` and CI run the end-to-end modules in parallel** (`tests/run_parallel.py`): the same tests as `tests/test_all.py`, with each module, and two shards of each of the four largest, in its own process and `OUT` directory. On a 4-core Linux machine all 936 tests took 21 minutes instead of 35. FFmpeg already uses several threads per encode, so more processes stop helping beyond that. `tests/test_all.py` still runs them one after another.
+- Fix statements that contradicted the code or each other; run the e2e tests in parallel; non-ASCII font paths on Windows (#365)
 
 ## 2.17.3
 
