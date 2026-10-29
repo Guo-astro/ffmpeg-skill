@@ -4,6 +4,12 @@
 
 ## Unreleased
 
+(nothing yet)
+
+## 2.19.0
+
+_Automated release: version and notes generated from pull requests merged since 2.18.0._
+
 ### Added
 
 - **Traditional Chinese captions get a Traditional face.** Han-only text always resolved a Simplified Chinese font, so a Taiwanese or Hong Kong caption was drawn in the mainland glyph forms (骨, 直 and 角 differ). `--lang zh-TW`, `zh-HK`, `zh-Hant` or `yue` on `caption.py` and `graphics.py` (or a brand's `lang`) now resolves a Traditional face: Noto Sans CJK TC, or Microsoft JhengHei on Windows. A machine without one draws with the Simplified face and records `font_variant_missing`.
@@ -14,6 +20,7 @@
 - **Japanese fillers split across whisper tokens are cut.** Whisper splits Japanese and Chinese into tokens, not words: えーと arrives as えー + と. Only a single token could match, so `--filler` never cut えーと or えっと and cut えー with と left behind. A run of up to four tokens that joins to a listed word now matches as that word. In Chinese and Japanese a match also needs punctuation or a 0.1 s pause on each side, so the あの of あの人 ("that person") is kept.
 - **`--filler-extra "you know"` matches.** A two-word marker could never match one engine word, though `--help` offered it.
 - **whisper.cpp transcripts in Japanese and Chinese have per-token timings.** whisper.cpp marks a word start with a space, so in an unspaced language a whole segment was glued into one "word" that no filler could match. Tokens between two whole characters now stay apart.
+- Filler words in Korean, Chinese, Russian, Dutch, Polish and Turkish; Japanese fillers split across whisper tokens; Traditional Chinese fonts (#371)
 
 ## 2.18.0
 
