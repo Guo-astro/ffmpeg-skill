@@ -3236,6 +3236,68 @@ class WindowsNirmalaTests(unittest.TestCase):
                     self.assertEqual(fonts.script_font_status("hi"), "missing")
 
 
+class WindowsFontPathTests(unittest.TestCase):
+    """drawtext hands fontfile= to FreeType, which opens it with the ANSI fopen on Windows: on the
+    gyan.dev 9.0.2 runner a font under `compat dir ünïcode` failed to load while the same file
+    under an ASCII directory loaded (measured on PR #365's CI). A non-ASCII path is given in its
+    8.3 short form, or copied to an ASCII name when the volume keeps no short names."""
+
+    def setUp(self):
+        import _common.drawtext as dt
+        self.dt = dt
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.font = self.tmp / "フォント" / "my font.ttf"
+        self.font.parent.mkdir()
+        self.font.write_bytes(b"font bytes")
+
+    def test_posix_and_ascii_paths_pass_through(self):
+        with unittest.mock.patch.object(self.dt, "_on_windows", return_value=False):
+            self.assertIn("フォント", self.dt.drawtext_fontfile(str(self.font)))
+        ascii_font = self.tmp / "my font.ttf"
+        with unittest.mock.patch.object(self.dt, "_on_windows", return_value=True):
+            self.assertEqual(self.dt.drawtext_fontfile(str(ascii_font)),
+                             "fontfile=" + self.dt.escape_filter_path(str(ascii_font), bind=False))
+
+    def test_windows_non_ascii_path_uses_the_short_form(self):
+        short = "C:/Users/TARO~1/FONT~1/MYFONT~1.TTF"
+        with unittest.mock.patch.object(self.dt, "_on_windows", return_value=True), \
+                unittest.mock.patch.object(self.dt, "_windows_short_path", return_value=short):
+            self.assertEqual(self.dt.drawtext_fontfile(str(self.font)),
+                             "fontfile=" + self.dt.escape_filter_path(short, bind=False))
+
+    def test_windows_without_short_names_draws_from_an_ascii_copy(self):
+        from _common import STATE
+        before = len(STATE.fallbacks)
+        tmpdir = self.tmp / "run"
+        tmpdir.mkdir()
+        with unittest.mock.patch.object(self.dt, "_on_windows", return_value=True), \
+                unittest.mock.patch.object(self.dt, "_windows_short_path", return_value=None), \
+                unittest.mock.patch.object(self.dt, "_drawtext_tmpdir", return_value=str(tmpdir)):
+            opt = self.dt.drawtext_fontfile(str(self.font))
+        copies = list(tmpdir.iterdir())
+        self.assertEqual(len(copies), 1)
+        self.assertTrue(copies[0].name.isascii() and copies[0].suffix == ".ttf")
+        self.assertEqual(copies[0].read_bytes(), b"font bytes")
+        self.assertIn(copies[0].name, opt)
+        self.assertIn(str(self.font), STATE.plan_inputs, "a plan binds the user's font, not the copy")
+        self.assertIn("font_path_copied", [f.get("code") for f in STATE.fallbacks[before:]])
+        # a font replaced in place gets a new copy, not the stale one
+        self.font.write_bytes(b"other font bytes")
+        os.utime(self.font, ns=(1, 1))
+        with unittest.mock.patch.object(self.dt, "_on_windows", return_value=True), \
+                unittest.mock.patch.object(self.dt, "_windows_short_path", return_value=None), \
+                unittest.mock.patch.object(self.dt, "_drawtext_tmpdir", return_value=str(tmpdir)):
+            self.dt.drawtext_fontfile(str(self.font))
+        self.assertEqual(sorted(p.read_bytes() for p in tmpdir.iterdir()), [b"font bytes", b"other font bytes"])
+
+    def test_a_missing_font_is_left_to_ffmpeg_not_a_traceback(self):
+        missing = str(self.tmp / "フォント" / "nope.ttf")
+        with unittest.mock.patch.object(self.dt, "_on_windows", return_value=True), \
+                unittest.mock.patch.object(self.dt, "_windows_short_path", return_value=None):
+            self.assertEqual(self.dt.drawtext_fontfile(missing), "fontfile=" + self.dt.escape_filter_path(missing))
+
+
 class EmojiTests(unittest.TestCase):
     """1.15: emoji are detected as clusters, measured at a full em, reserved in the ASS and
     composited as PNGs -- and every degraded path says so instead of lying."""
