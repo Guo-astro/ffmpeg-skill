@@ -4001,6 +4001,155 @@ def garbage_payload(p):
         self.assertAlmostEqual(doc["silence_breakdown"]["digital"]["seconds"], 1.0, delta=0.1)
         self.assertAlmostEqual(doc["silence_breakdown"]["below_threshold"]["seconds"], 1.0, delta=0.1)
 
+    def test_silence_writes_a_map_from_source_to_output_times(self):
+        """X request (2026-10-30): after a silence cut, find a sentence again and re-time subtitles.
+        --timemap writes, as JSON or CSV by extension, each kept range with its time in the source
+        and in the output, and each removed range; under --dry-run nothing is written."""
+        wav = self.out("tm.wav")
+        # silence at both ends too, so the leading and trailing removed ranges are exercised
+        ffmpeg("-f", "lavfi", "-i", "aevalsrc='0.5*sin(2*PI*440*t)*(between(t\\,1\\,2)+between(t\\,3\\,5)+between(t\\,6\\,7))':s=48000:d=8", wav)
+        jmap, cmap = self.out("tm.json"), self.out("tm.csv")
+        # --margin 0: the margin is kept at the file's ends too, which would hide the edge ranges
+        doc = json.loads(tool("silence", wav, "-o", self.out("tm_out.wav"), "--timemap", jmap, "--margin", "0",
+                              "--overwrite", "--json").stdout)
+        tm = json.loads(jmap.read_text(encoding="utf-8"))
+        self.assertEqual(doc["timemap"], str(jmap))
+        kept, removed = tm["kept"], tm["removed"]
+        self.assertEqual(len(kept), len(doc["keep"]))
+        out_t = 0.0
+        for seg, (s, e) in zip(kept, doc["keep"]):
+            self.assertEqual((seg["source_start"], seg["source_end"]), (s, e))
+            self.assertAlmostEqual(seg["output_start"], out_t, places=3)
+            out_t += e - s
+            self.assertAlmostEqual(seg["output_end"], out_t, places=3)
+        self.assertAlmostEqual(out_t, doc["kept_duration"], places=2)
+        # the map is computed, not measured: the written audio must still agree with it to within
+        # about one audio block per kept range (whole blocks are kept at each cut)
+        written = float(probe_streams(self.out("tm_out.wav"))["audio"])
+        self.assertLess(abs(written - kept[-1]["output_end"]), 0.03 * len(kept), (written, kept[-1]))
+        # removed ranges are exactly the lead-in, the gaps between kept ones and the tail, each
+        # placed at its output cut point
+        bounds = [0.0] + [b for k in kept for b in (k["source_start"], k["source_end"])] + [doc["input_duration"]]
+        expect = [{"source_start": a, "source_end": b, "output_time": t}
+                  for (a, b), t in zip(zip(bounds[::2], bounds[1::2]), [0.0] + [k["output_end"] for k in kept])]
+        self.assertEqual(len(removed), len(kept) + 1)
+        for got, want in zip(removed, expect):
+            for key in want:
+                self.assertAlmostEqual(got[key], want[key], places=3, msg=(got, want))
+        tool("silence", wav, "-o", self.out("tm_out2.wav"), "--timemap", cmap, "--margin", "0", "--overwrite")
+        rows = cmap.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(rows[0], "type,source_start,source_end,output_start,output_end")
+        self.assertEqual(sum(1 for r in rows if r.startswith("kept,")), len(kept))
+        self.assertEqual(sum(1 for r in rows if r.startswith("removed,")), len(removed))
+        cells = [r.split(",") for r in rows[1:]]
+        self.assertEqual([r[1:] for r in cells if r[0] == "kept"],
+                         [["%.3f" % k[c] for c in ("source_start", "source_end", "output_start", "output_end")] for k in kept])
+        self.assertEqual([r[1:] for r in cells if r[0] == "removed"],
+                         [["%.3f" % g["source_start"], "%.3f" % g["source_end"], "%.3f" % g["output_time"], "%.3f" % g["output_time"]]
+                          for g in removed])
+        dry = self.out("tm_dry.json")
+        tool("silence", wav, "-o", self.out("tm_dry.wav"), "--timemap", dry, "--dry-run")
+        self.assertFalse(dry.exists(), "a dry run wrote the time map")
+
+    def test_silence_reports_the_level_at_every_cut_and_warns_near_speech(self):
+        """X request (2026-10-30): probe checks parameters, not whether a cut landed on a breath or
+        a word's tail. The result now carries the RMS just around each cut, and warns where it is
+        within CUT_SOUND_MARGIN_DB of --threshold: room tone sits far below, a weak tail does not."""
+        wav = self.out("tail.wav")
+        # loud speech stand-in, a weak tail (about -29 dBFS RMS), then digital silence, then speech
+        ffmpeg("-f", "lavfi", "-i", "aevalsrc='0.5*sin(2*PI*440*t)*(lt(t\\,2)+gt(t\\,4))"
+               "+0.05*sin(2*PI*300*t)*between(t\\,2\\,2.8)':s=48000:d=6", wav)
+        safe = json.loads(tool("silence", wav, "--list", "--json").stdout)
+        self.assertTrue(safe["cut_points"], safe)
+        # the padding left on each side of a cut is 0.2 s by default (0.15 before 2.22: weak word
+        # endings were the complaint), so the first cut sits 0.2 s into the silence at 2.8 s
+        props = self.tools["silence"]["input_schema"]["properties"]
+        self.assertEqual(next(p for p in props.values() if "--margin" in (p.get("cli") or []))["default"], 0.2)
+        self.assertAlmostEqual(safe["keep"][0][1], safe["silences"][0][0] + 0.2, places=2)
+        for c in safe["cut_points"]:
+            self.assertEqual(set(c), {"source_time", "output_time", "edge", "rms_dbfs"})
+        self.assertEqual(safe["cut_warnings"], [])  # the default -35 dB cut is inside digital silence
+        hard = json.loads(tool("silence", wav, "--threshold", "-25", "--list", "--json").stdout)
+        self.assertTrue(hard["cut_warnings"], hard["cut_points"])  # -25 dB cuts into the weak tail
+        w = hard["cut_warnings"][0]
+        import importlib
+        self.assertGreater(w["rms_dbfs"], -25 - importlib.import_module("silence").CUT_SOUND_MARGIN_DB)
+        self.assertTrue(any(d["code"] == "cut_near_sound" for d in hard["diagnostics"]["warnings"]))
+
+    def test_silence_time_map_and_cut_levels_hold_at_the_edges(self):
+        """Review of the 2.22 change: the map advanced by unrounded lengths while the render cuts on
+        millisecond-rounded bounds; a filler merged into a silence exempted the silence's own edge
+        from the warning; a mono downmix read an antiphase stereo cut as silence; a failed decode
+        read as digital silence; --timemap replaced an existing file without --overwrite."""
+        import importlib
+        silence = importlib.import_module("silence")
+        tm = silence.time_map([(0.0, 1.0004), (2.0006, 3.0)], 3.0)
+        a, b = tm["kept"]
+        self.assertEqual((a["output_end"], b["output_start"]), (1.0, 1.0))
+        self.assertEqual(round(b["output_end"] - b["output_start"], 3), round(b["source_end"] - b["source_start"], 3))
+        # left and right in antiphase: a mono mix is digital silence, either channel is not
+        wav = self.out("anti.wav")
+        ffmpeg("-f", "lavfi", "-i", "aevalsrc='0.3*sin(2*PI*440*t)|-0.3*sin(2*PI*440*t)':s=48000:d=3", wav)
+        tm = {"kept": [], "removed": [{"source_start": 1.0, "source_end": 2.0, "output_time": 1.0}]}
+        points = silence.cut_levels(str(wav), tm, 3.0, [(1.7, 2.0)])
+        self.assertEqual([(p["edge"], bool(p.get("filler"))) for p in points], [("out", False), ("in", True)])
+        self.assertIsNotNone(points[0]["rms_dbfs"])
+        self.assertGreater(points[0]["rms_dbfs"], -20)
+        junk = self.out("not_media.wav"); junk.write_bytes(b"not audio at all")
+        self.assertIsNone(silence.cut_levels(str(junk), tm, 3.0, []))  # unmeasured, not "silence"
+        # an existing map is refused without --overwrite, and a dry run predicts the refusal
+        src = self.out("tm_ow.wav")
+        ffmpeg("-f", "lavfi", "-i", "aevalsrc='0.5*sin(2*PI*440*t)*(lt(t\\,2)+gt(t\\,3))':s=48000:d=5", src)
+        existing = self.out("tm_ow.json"); existing.write_text("theirs", encoding="utf-8")
+        for extra in ([], ["--dry-run"]):
+            err = json.loads(tool("silence", src, "-o", self.out("tm_ow_out.wav"), "--timemap", existing, "--json",
+                                  *extra, check=False).stdout)["error"]
+            self.assertEqual(err["reason"], "output_exists")
+            self.assertEqual(existing.read_text(encoding="utf-8"), "theirs")
+            self.assertFalse(self.out("tm_ow_out.wav").exists(), "refused after the cut was written")
+        # a bad map path is a structured refusal, not a traceback from open()
+        dir_named_json = self.work / "tm_dir.json"; dir_named_json.mkdir(exist_ok=True)
+        for bad, reason in ((self.work / "no_such_dir" / "m.json", "output_dir_missing"), (dir_named_json, "output_is_directory")):
+            proc = tool("silence", src, "-o", self.out("tm_bad.wav"), "--timemap", bad, "--json", check=False)
+            self.assertEqual(json.loads(proc.stdout)["error"]["reason"], reason, proc.stderr)
+        # the map is written only once the cut it describes exists: a refused encode leaves none
+        taken = self.out("tm_taken.wav"); taken.write_bytes(b"theirs")
+        fresh = self.out("tm_fresh.json")
+        err = json.loads(tool("silence", src, "-o", taken, "--timemap", fresh, "--json", check=False).stdout)["error"]
+        self.assertEqual(err["reason"], "output_exists")
+        self.assertFalse(fresh.exists(), "a map was left beside a cut that was never written")
+        # the map never lands on the input, the cut or the EDL, even with --overwrite
+        src_copy = self.out("tm_src.json"); shutil.copy(src, src_copy)
+        before = src_copy.read_bytes()
+        err = json.loads(tool("silence", src_copy, "--list", "--timemap", src_copy, "--overwrite", "--json",
+                              check=False).stdout)["error"]
+        self.assertEqual(err["reason"], "output_is_input")
+        self.assertEqual(src_copy.read_bytes(), before, "the map replaced the source")
+        words = self.out("tm_words.json"); words.write_text('{"segments": []}', encoding="utf-8")
+        err = json.loads(tool("silence", src, "--filler", "--words", words, "--list", "--timemap", words, "--overwrite",
+                              "--json", check=False).stdout)["error"]
+        self.assertEqual(err["reason"], "output_is_input")
+        self.assertEqual(words.read_text(encoding="utf-8"), '{"segments": []}', "the map replaced the transcript")
+        # the map is staged and swapped in: a write that fails leaves the previous map whole
+        from unittest import mock
+        old = self.out("tm_old.json"); old.write_text("previous map", encoding="utf-8")
+        with mock.patch.object(silence.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                silence.write_time_map(str(old), {"kept": [], "removed": []})
+        self.assertEqual(old.read_text(encoding="utf-8"), "previous map")
+        self.assertEqual(sorted(p.name for p in old.parent.iterdir() if p.name.endswith(".tmp")), [],
+                         "a staging file was left behind")
+        # the staging file is a fresh unique name: a sibling that happens to exist is never truncated
+        bystander = self.out("tm_old.json.tmp%d" % os.getpid()); bystander.write_text("not ours", encoding="utf-8")
+        silence.write_time_map(str(old), {"kept": [], "removed": []})
+        self.assertEqual(bystander.read_text(encoding="utf-8"), "not ours")
+        self.assertEqual(json.loads(old.read_text(encoding="utf-8")), {"kept": [], "removed": []})
+        bystander.unlink()
+        same = self.out("tm_same.csv")
+        for extra in (["-o", same], ["--edl", same, "--list"], ["--plan", same, "--dry-run", "-o", self.out("tm_plan.wav")]):
+            proc = tool("silence", src, "--timemap", same, "--overwrite", "--json", *extra, check=False)
+            self.assertEqual(json.loads(proc.stdout)["error"]["reason"], "timemap_path_taken", (extra, proc.stderr))
+
     def test_the_thresholds_table_matches_the_code(self):
         """references/scripts.md restates every verdict threshold (2.21). Each row names the constant
         or flag it comes from, and its value must be that constant's or that flag's default; the
@@ -4010,7 +4159,7 @@ def garbage_payload(p):
         block = text.split("<!-- thresholds:start -->", 1)[1].split("<!-- thresholds:end -->", 1)[0]
         rows = [r for r in block.strip().splitlines()[2:] if r.startswith("|")]
         # every threshold: a row deleted (or added) must be a deliberate edit here too
-        self.assertEqual(len(rows), 28)
+        self.assertEqual(len(rows), 29)
         for row in rows:
             what, value, source, _used = [c.strip() for c in row.strip("|").split("|")]
             number = float(re.search(r"-?\d+(?:\.\d+)?", value).group(0))

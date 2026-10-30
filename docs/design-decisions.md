@@ -53,6 +53,7 @@ exists. When a decision changes, edit the entry in the same PR.
 - [2.19.0 — filler words in Korean, Chinese, Russian, Dutch, Polish and Turkish](#2190--filler-words-in-korean-chinese-russian-dutch-polish-and-turkish)
 - [2.20 — a length or a silence is checked against a yardstick the tool did not make](#220--a-length-or-a-silence-is-checked-against-a-yardstick-the-tool-did-not-make)
 - [2.21.1 — a stream that ends early or decodes nothing fails the check](#2211--a-stream-that-ends-early-or-decodes-nothing-fails-the-check)
+- [2.22 — silence.py says where it cut, and where to listen](#222--silencepy-says-where-it-cut-and-where-to-listen)
 <!-- contents:end -->
 
 ## Time limits
@@ -2270,3 +2271,33 @@ What was decided there:
   though, are meant to be pasted and run again, and a deny-list of characters missed the backtick,
   a leading `#` and `~`, and `!`. Any argument outside `[A-Za-z0-9_@%+=:,./-]` is single-quoted now.
   Test: `test_printed_commands_run_unchanged_in_a_posix_shell`, which runs the quoted line in `sh`.
+
+## 2.22 — silence.py says where it cut, and where to listen
+
+- **A cut near sound is a warning, not a failed check.** `cut_points` measures the RMS 50 ms
+  either side of every cut on the source, and `cut_warnings` lists those within 10 dB of
+  `--threshold` (`CUT_SOUND_MARGIN_DB`). Room tone sits well below the threshold; a breath or a
+  word's weak tail sits just under it. A level is not a judgement of speech: a quiet word and a
+  loud breath can read the same, and a cut the user asked for at -25 dB is still what they asked
+  for. So `verified` is unchanged, the warning says where to listen, and `removed_span_content`
+  stays in `unverified`. Filler-word cuts sit in sound by design and are measured but not
+  flagged. Code: `silence.cut_levels()`. Test:
+  `test_silence_reports_the_level_at_every_cut_and_warns_near_speech`, where the default
+  threshold cuts in digital silence (no warning) and -25 dB cuts into a -29 dB tail (a warning).
+  The level is the loudest channel, not a mono mix (antiphase stereo would read as silence);
+  `filler` is set per edge, so a filler merged into a silence leaves the silence's other edge
+  checked; a decode that fails gives `cut_points: null` and `cut_levels_unmeasured`, never a
+  silent reading. The `--timemap` file is checked up front (path, existing file) and written
+  only after the cut: a map beside a refused or failed encode would describe media never made.
+  Test: `test_silence_time_map_and_cut_levels_hold_at_the_edges`.
+- **No second padding flag; `--margin` goes from 0.15 s to 0.2 s.** A request asked for
+  100-300 ms of padding around cuts, with a safe default. `--margin` is that setting already, and
+  `--speech-aware` keeps breaths inside a sentence. A `--padding` alias would be a second name for
+  one setting in the contract and every surface that lists flags, so the docs point at `--margin`.
+  The default moves to 0.2 s, still inside the asked range: weak word endings were the complaint,
+  and 50 ms more air per side costs a little tightness, which `--margin 0.15` gives back. A
+  template that sets its own margin (`templates/podcast.json`, 0.15) keeps it. Test: the default
+  check in `test_silence_reports_the_level_at_every_cut_and_warns_near_speech`.
+- **`--timemap` is an artifact, like `--edl`.** It is written beside the cut and not under
+  `--dry-run`. Its output times are the sums of the kept ranges, the same arithmetic the render
+  uses. Test: `test_silence_writes_a_map_from_source_to_output_times`.

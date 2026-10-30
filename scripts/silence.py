@@ -6,7 +6,7 @@ side so words are not clipped, drops gaps shorter than --min-silence, and
 writes a frame-accurate re-encode in one pass (select, and ametadata for the sound).
 
 Examples:
-  python3 silence.py talk.mp4                                 # -35 dB, gaps >= 0.6 s, 0.15 s margin
+  python3 silence.py talk.mp4                                 # -35 dB, gaps >= 0.6 s, 0.2 s margin
   python3 silence.py talk.mp4 --threshold -40 --min-silence 1 --margin 0.25
   python3 silence.py talk.mp4 --list                          # print the silences and the resulting cut list, no output
   python3 silence.py talk.mp4 --edl keep.txt                  # also save the kept ranges (START-END per line, cut.py --segments format)
@@ -15,7 +15,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 # `detect` moved into _common/probe.py in 1.16.0 so metadata.py --auto-chapters can measure the
 # same silences without importing this tool; the body is unchanged and the name still lives here.
@@ -23,6 +23,8 @@ from _common import (filler_spans, FILLER_WORDS, FILLER_AMBIGUOUS, FILLER_DISCOU
                      FILLER_PAD, read_text_or_die)
 from _common import asr as _asr
 from _common.emit import warn
+from _common import refuse_existing_outputs, refuse_output_is_input, _check_output_path
+from _common.emit import refuse
 from _common import detect_silences as detect, STATE, video_args, add_common, apply_common, audio_codec_for, cfr_args, default_output, die, emit, ffmpeg_base, info, is_audio_output, print_json, probe, run, X264_PRESETS, measured_level_dbfs, fmt_secs
 
 
@@ -44,6 +46,13 @@ def merge_spans(spans: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
     return out
 
 
+# around each cut, how many seconds on either side the level is measured over, and how close to
+# --threshold (in dB) that level may come before the cut is flagged: room tone sits far below the
+# threshold, a breath or a word's weak tail just under it
+CUT_LEVEL_WINDOW = 0.05
+CUT_SOUND_MARGIN_DB = 10.0
+CUT_LEVEL_RATE = 8000
+CUT_LEVEL_CHANNELS = 2  # measured one by one; a surround source is folded to two first
 DIGITAL_SILENCE_DB = -90.0  # 2.20: at or below this a span is digital silence (16-bit dither sits near -96)
 BREATH_FLOOR = 0.12  # shortest gap silencedetect is asked for under --speech-aware
 
@@ -86,6 +95,114 @@ def keep_ranges(silences: List[Tuple[float, float]], duration: float, margin: fl
     if duration - cursor >= min_keep:
         keeps.append((cursor, duration))
     return keeps
+
+
+def time_map(keeps: List[Tuple[float, float]], duration: float) -> Dict[str, Any]:
+    """Each kept range with its time in the source and in the output, and each removed range with
+    the output time it was cut at: re-timing subtitles, or finding a removed sentence again."""
+    kept: List[Dict[str, float]] = []
+    removed: List[Dict[str, float]] = []
+    out, prev = 0.0, 0.0
+    for s, e in keeps:
+        # the render cuts on bounds rounded to the millisecond (between(t,s,e) below): advance by
+        # that rounded length, or every off-grid range adds its own error to every later time
+        s, e = round(s, 3), round(e, 3)
+        if s - prev > 0.0005:
+            removed.append({"source_start": round(prev, 3), "source_end": round(s, 3), "output_time": round(out, 3)})
+        kept.append({"source_start": round(s, 3), "source_end": round(e, 3),
+                     "output_start": round(out, 3), "output_end": round(out + (e - s), 3)})
+        out += e - s
+        prev = e
+    if duration - prev > 0.0005:
+        removed.append({"source_start": round(prev, 3), "source_end": round(duration, 3), "output_time": round(out, 3)})
+    return {"kept": kept, "removed": removed}
+
+
+def write_time_map(path: str, tm: Dict[str, Any]) -> None:
+    """--timemap: JSON, or CSV for a .csv path (one row per kept and removed range)."""
+    if os.path.splitext(path)[1].lower() == ".csv":
+        rows = ["type,source_start,source_end,output_start,output_end"]
+        rows += [f"kept,{k['source_start']:.3f},{k['source_end']:.3f},{k['output_start']:.3f},{k['output_end']:.3f}" for k in tm["kept"]]
+        rows += [f"removed,{r['source_start']:.3f},{r['source_end']:.3f},{r['output_time']:.3f},{r['output_time']:.3f}" for r in tm["removed"]]
+        text = "\n".join(rows) + "\n"
+    else:
+        text = json.dumps(tm, indent=2) + "\n"
+    # staged and swapped in, so a full disk or an interrupted write leaves the previous map whole;
+    # the staging name is short and unique, so it neither outgrows the name limit nor truncates a
+    # sibling that happens to exist
+    import tempfile
+    fd, tmp = tempfile.mkstemp(prefix=".tm", suffix=".tmp", dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        mask = os.umask(0)  # mkstemp makes the file 0600; give the map the mode open() would have
+        os.umask(mask)
+        os.chmod(tmp, 0o666 & ~mask)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def cut_levels(path: str, tm: Dict[str, Any], duration: float,
+               filler_spans_: List[Tuple[float, float]]) -> Optional[List[Dict[str, Any]]]:
+    """The RMS level just around every cut, in dBFS (None for digital silence), measured on the
+    source: one decode at CUT_LEVEL_RATE, CUT_LEVEL_WINDOW on each side of the cut point. A probe
+    of the output can say its length and streams are right, not whether a cut landed in a breath
+    or a word's weak tail; the level there is the measurable part of that question. `edge` is
+    `out` where the source is left, `in` where it is picked up again; `filler` marks an edge that
+    sits on a removed word (it is meant to sit in sound). Each channel is measured on its own and
+    the loudest is reported: a mono mix reads antiphase stereo as silence. The PCM goes to a temp
+    file and only the windows are read back, so an hour of audio is not held in memory. None when
+    the decode fails: an unmeasured cut is not a silent one."""
+    import array
+    import math
+    import tempfile
+    from _common import require_tool, run_analysis
+    points = []
+    for r in tm["removed"]:
+        for t, edge in ((r["source_start"], "out"), (r["source_end"], "in")):
+            if (edge == "out" and t <= 0.0005) or (edge == "in" and t >= duration - 0.0005):
+                continue
+            # this edge, not the whole removed range: a filler merged into a silence leaves the
+            # silence's own edge next to speech, and that one still gets checked
+            on_word = any(fs - CUT_LEVEL_WINDOW <= t <= fe + CUT_LEVEL_WINDOW for fs, fe in filler_spans_)
+            points.append((t, r["output_time"], edge, on_word))
+    if not points:
+        return []
+    channels = CUT_LEVEL_CHANNELS
+    half = int(CUT_LEVEL_WINDOW * CUT_LEVEL_RATE)
+    frame = 2 * channels
+    out = []
+    with tempfile.TemporaryDirectory(prefix="silence-levels-") as tmp:
+        raw = os.path.join(tmp, "pcm.s16le")
+        proc = run_analysis([require_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-i", path, "-vn",
+                             "-ac", str(channels), "-ar", str(CUT_LEVEL_RATE), "-f", "s16le", "-y", raw],
+                            check=False, text=False)
+        if proc.returncode != 0 or not os.path.isfile(raw) or not os.path.getsize(raw):
+            return None
+        with open(raw, "rb") as fh:
+            for t, ot, edge, on_word in points:
+                first = max(0, int(round(t * CUT_LEVEL_RATE)) - half)
+                fh.seek(first * frame)
+                data = fh.read(2 * half * frame)
+                block = array.array("h")
+                block.frombytes(data[: len(data) // frame * frame])
+                if sys.byteorder == "big":
+                    block.byteswap()
+                level = None
+                if block:
+                    n = len(block) // channels
+                    peak = max(math.sqrt(sum(x * x for x in block[c::channels]) / n) for c in range(channels)) / 32768.0
+                    level = round(20 * math.log10(peak), 1) if peak > 0 else None
+                entry = {"source_time": round(t, 3), "output_time": round(ot, 3), "edge": edge, "rms_dbfs": level}
+                if on_word:
+                    entry["filler"] = True
+                out.append(entry)
+    return out
 
 
 def _word_list(text: "str") -> "list":
@@ -289,7 +406,7 @@ def main() -> int:
     ap.add_argument("-o", "--output", help="output file (default: <name>_tight.<ext>)")
     ap.add_argument("--threshold", type=float, default=-35.0, help="silence level in dBFS (default -35; use -40..-45 for quiet rooms)")
     ap.add_argument("--min-silence", type=float, default=0.6, help="only remove gaps at least this long in seconds (default 0.6)")
-    ap.add_argument("--margin", type=float, default=0.15, help="seconds of silence to keep on each side of speech (default 0.15)")
+    ap.add_argument("--margin", type=float, default=0.2, help="seconds of silence to keep on each side of speech (default 0.2; 0.15 before 2.22)")
     ap.add_argument("--min-keep", type=float, default=0.2, help="drop kept pieces shorter than this (default 0.2)")
     ap.add_argument("--speech-aware", action="store_true",
                     help="keep breaths shorter than --min-silence when they sit inside a sentence "
@@ -298,6 +415,10 @@ def main() -> int:
                          "with --filler through the same keep_ranges() removal list.")
     ap.add_argument("--list", action="store_true", help="only print silences and the kept ranges")
     ap.add_argument("--edl", help="write the kept ranges to this file, one START-END per line")
+    ap.add_argument("--timemap", metavar="FILE",
+                    help="write the source-to-output time map: every kept range with its source and output "
+                         "times and every removed range with the output time it was cut at; .csv for CSV, "
+                         "otherwise JSON (re-time subtitles, find a removed sentence again)")
     fil = ap.add_argument_group("filler words (1.17)")
     fil.add_argument("--filler", action="store_true",
                      help="also remove filler words. Needs measured word timings: pass --words or "
@@ -336,6 +457,20 @@ def main() -> int:
     add_common(ap)
     args = ap.parse_args()
     apply_common(args)
+    if args.timemap:
+        if os.path.splitext(args.timemap)[1].lower() not in (".json", ".csv"):
+            die(f"--timemap must end in .json or .csv: {args.timemap}", kind="input")
+        # before any decode or write, so a dry run predicts it too: a missing directory or a
+        # directory at the path is a `kind: input` refusal, not a traceback from open()
+        _check_output_path([args.timemap])
+        # --overwrite allows replacing an old map, never the source, the cut or the EDL
+        refuse_output_is_input(args.timemap, *[p for p in (args.input, args.words) if p])
+        for flag, other in (("-o", args.output), ("--edl", args.edl), ("--plan", getattr(args, "plan", None))):
+            if other and os.path.realpath(other) == os.path.realpath(args.timemap):
+                refuse("input", "timemap_path_taken",
+                       f"--timemap {args.timemap} is the same file as {flag}; give the map its own path",
+                       timemap=args.timemap, flag=flag, path=other)
+        refuse_existing_outputs([args.timemap])
 
     if args.filler_pad < 0:
         die("--filler-pad cannot be negative: a negative pad turns each word's span inside out "
@@ -431,6 +566,35 @@ def main() -> int:
             summary["hint"] = f"no passage sits below {args.threshold:g} dBFS for {args.min_silence:g}s; try a higher --threshold (e.g. -25) or a shorter --min-silence"
         info("hint: " + summary["hint"])
 
+    tm = time_map(keeps, duration)
+    points: Any = False  # False: not measured (a dry run over a pending input); None: the decode failed
+    if not (STATE.dry_run and not os.path.exists(args.input)):
+        points = cut_levels(args.input, tm, duration, list(filler_ranges))
+    if points is None:
+        warn("could not decode the source to measure the level at each cut; cut_points and cut_warnings are null "
+             "(unmeasured, not silent): listen at the cuts", "cut_levels_unmeasured")
+        summary["cut_points"] = summary["cut_warnings"] = None
+    elif points is not False:
+        near = [{k: v for k, v in c.items() if k != "filler"} for c in points
+                if not c.get("filler") and c["rms_dbfs"] is not None and c["rms_dbfs"] > args.threshold - CUT_SOUND_MARGIN_DB]
+        summary["cut_points"] = points
+        summary["cut_warnings"] = near
+        if near:
+            where = ", ".join("%.2fs" % c["source_time"] for c in near[:5]) + (", ..." if len(near) > 5 else "")
+            warn(f"{len(near)} cut point(s) sit within {CUT_SOUND_MARGIN_DB:g} dB of --threshold ({where}): "
+                 "a breath or a word's weak tail may be cut; listen there, or lower --threshold / raise --margin",
+                 "cut_near_sound", cuts=len(near))
+
+    def finish_time_map() -> None:
+        """Written last, once the cut it describes exists (or under --list, where the map is the
+        result): a map left beside a failed or refused encode would describe media never made."""
+        if not args.timemap:
+            return
+        if not STATE.dry_run:  # an artifact like the EDL: a plan writes nothing
+            write_time_map(args.timemap, tm)
+            info(f"wrote {args.timemap}")
+        summary["timemap"] = args.timemap
+
     if args.edl:
         if not STATE.dry_run:  # the EDL is an artifact like the cut itself: a plan writes nothing
             with open(args.edl, "w", encoding="utf-8") as fh:
@@ -439,6 +603,7 @@ def main() -> int:
         info(f"wrote {args.edl}")
 
     if args.list or args.filler_list:
+        finish_time_map()
         if args.json:
             emit(None, **summary)
         else:
@@ -469,6 +634,7 @@ def main() -> int:
     run(cmd)
     r = probe(output, role="output")
     info(f"wrote {output} ({fmt_secs(r['duration'])}, expected ~{kept:.3f}s)")
+    finish_time_map()
     emit(output, **summary)
     return 0
 
