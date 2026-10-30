@@ -396,19 +396,188 @@ UNVERIFIED: Dict[str, List[str]] = {
 }
 
 
-def stream_inventory_step(meta: Dict[str, Any], expect: Dict[str, bool]) -> Dict[str, Any]:
+# a picture and its sound may differ in length by this much more than they did in the input
+STREAM_LENGTH_TOLERANCE = 0.25
+# how many seconds at each end of every kept stream the decode check decodes
+DECODE_WINDOW_SECONDS = 1.0
+# how much earlier than its window the tail decode starts reading (a seek past the last keyframe)
+DECODE_SEEK_MARGIN_SECONDS = 10.0
+# how far back the one retry of an empty tail reads (a GOP longer than the margin)
+DECODE_LONG_GOP_SECONDS = 60.0
+
+
+def _expected_count(want: Any) -> int:
+    """`expect_streams` values: a count, or True/False for "at least one" / "none"."""
+    return int(want) if not isinstance(want, bool) else (1 if want else 0)
+
+
+def stream_inventory_step(meta: Dict[str, Any], expect: Dict[str, Any]) -> Dict[str, Any]:
     """The output's stream composition checked against what the operation should have produced
     (#367: a cut of an MPEG-TS source lost its whole video stream and still said verified: true,
     because the only properties measured were duration and start skew). `expect` comes from the
     input's own probe and the tool's arguments (provenance "input_premeasurement"): a stream the
-    input had and the operation was not told to drop must still be there."""
-    measured = {kind: bool(meta.get(kind)) for kind in expect}
-    missing = [k for k, want in expect.items() if want and not measured[k]]
-    step: Dict[str, Any] = {"step": "streams", "property": "stream_inventory", "expected": dict(expect),
-                            "measured": measured, "provenance": "input_premeasurement", "ok": not missing}
+    input had and the operation was not told to drop must still be there. A value is a count
+    (the cut, join and export writers map one stream of each kind) or a bool for "at least one";
+    fewer streams than that is `missing`."""
+    counts = meta.get("stream_counts") or {k: int(bool(meta.get(k))) for k in expect}
+    want = {k: _expected_count(v) for k, v in expect.items()}
+    got = {k: int(counts.get(k) or 0) if meta.get(k) else 0 for k in expect}
+    missing = [k for k in expect if got[k] < want[k]]
+    step: Dict[str, Any] = {"step": "streams", "property": "stream_inventory",
+                            "expected": {k: want[k] > 0 for k in expect}, "measured": {k: got[k] > 0 for k in expect},
+                            "expected_count": want, "measured_count": got,
+                            "provenance": "input_premeasurement", "ok": not missing}
     if missing:
         step["missing"] = missing
     return step
+
+
+def stream_length(meta: Dict[str, Any], kind: str) -> Optional[float]:
+    """One stream's own length: its duration, else the DURATION tag Matroska/WebM keep. A value
+    that is not a finite number is no length (a NaN compares false and would pass every check)."""
+    s = meta.get(kind) or {}
+    for v in (s.get("duration"), s.get("tagged_duration")):
+        if isinstance(v, (int, float)) and math.isfinite(v) and v > 0:
+            return float(v)
+    return None
+
+
+def stream_end(meta: Dict[str, Any], kind: str) -> Optional[float]:
+    """Where one stream ends on the file's timeline: its start plus its own length."""
+    length = stream_length(meta, kind)
+    return None if length is None else ((meta.get(kind) or {}).get("start_time") or 0.0) + length
+
+
+def file_origin(meta: Dict[str, Any]) -> float:
+    """Where the file's timeline starts: the container's start time, else its earliest stream's.
+    A -ss, a cut's --start and a window are counted from here, while stream starts and ends are
+    on the file's own timestamps."""
+    if isinstance(meta.get("start_time"), (int, float)):
+        return float(meta["start_time"])
+    starts = [(meta.get(k) or {}).get("start_time") for k in ("video", "audio")]
+    return min([s for s in starts if isinstance(s, (int, float))] or [0.0])
+
+
+def stream_lengths_step(meta: Dict[str, Any], references: Sequence[Dict[str, Any]],
+                        tolerance: float = STREAM_LENGTH_TOLERANCE,
+                        windows: Optional[Sequence[Tuple[float, float]]] = None) -> Dict[str, Any]:
+    """Where the picture and the sound of the output end, against each other, allowing the gap
+    the inputs already had. A filename with a space was reported to have lost 40 s of sound with
+    no error: the container's length is the longest stream's, so a duration check passes while
+    one stream stops early. `short` names a stream that ends more than `tolerance` (plus the
+    inputs' own shortfall, summed over the inputs) before the other one. Ends, not lengths: a
+    stream that only starts late is the start-skew check's (cut.py reports it in a note). A length
+    that cannot be read is not a pass (`not_measured`). `windows` (cut.py's requested ranges, on
+    the input's own timeline) count only the gap the input has inside them: a source whose video
+    runs 5 s past its sound allows nothing to a cut from its middle."""
+    kinds = ("video", "audio")
+    lengths = {k: stream_length(meta, k) for k in kinds}
+    step: Dict[str, Any] = {"step": "stream_lengths", "property": "stream_end", "measured": lengths,
+                            "tolerance": tolerance, "provenance": "input_premeasurement"}
+    unknown = [k for k in kinds if lengths[k] is None]
+    if unknown:
+        return dict(step, ok=False, reason="not_measured: no length for the %s stream" % " and ".join(unknown))
+    allowed: Dict[str, float] = {k: 0.0 for k in kinds}
+    unread_input = False
+    for ref in references:
+        if not all(ref.get(k) for k in kinds):
+            continue  # an input with one stream (join's silent clip) brings no gap of its own
+        ref_ends = {k: stream_end(ref, k) for k in kinds}
+        if None in ref_ends.values():
+            unread_input = True  # its gap is unknown, not zero
+            continue
+        rel = {k: ref_ends[k] - file_origin(ref) for k in kinds}  # the clock cut's ranges are on
+        for s, e in (windows or [(0.0, max(rel.values()))]):
+            inside = {k: max(s, min(e, rel[k])) for k in kinds}
+            top = max(inside.values())
+            for k in kinds:
+                allowed[k] += top - inside[k]
+    ends = {k: stream_end(meta, k) for k in kinds}
+    last = max(ends.values())
+    raw = {k: last - ends[k] for k in kinds}
+    short = [k for k in kinds if raw[k] > allowed[k] + tolerance]
+    step.update(ends={k: round(v, 3) for k, v in ends.items()}, shortfall={k: round(v, 3) for k, v in raw.items()},
+                input_shortfall={k: round(v, 3) for k, v in allowed.items()}, ok=not short)
+    if short and unread_input:
+        # a gap the output has may be one an input already had: neither a pass nor a "short"
+        step["input_shortfall"] = None
+        step["reason"] = ("not_measured: an input's stream length cannot be read, so whether the %s gap "
+                          "was already in the input is unknown" % " and ".join(short))
+    elif short:
+        step["short"] = short
+    return step
+
+
+def decode_step(path: str, meta: Dict[str, Any], kinds: Sequence[str], window: float = DECODE_WINDOW_SECONDS) -> Dict[str, Any]:
+    """Decode the first `window` seconds of every kept stream and the last `window` before that
+    stream's own end, and count the frames. A stream ffprobe lists from the container header can
+    still hold nothing a decoder accepts; the inventory and length checks read the header, this
+    one reads the payload. The tail read starts DECODE_SEEK_MARGIN_SECONDS earlier, so a seek that
+    lands past the last keyframe (MPEG-TS seeks by timestamp, not to a keyframe) still decodes,
+    but only frames in the last `window` count, and the read stops a second past the end. A
+    stream whose own end cannot be read is not decoded at its end: its tail is `not_measured`,
+    not undecodable (the container's end is the longest stream's, not this one's)."""
+    from _common.runner import require_tool, run_analysis
+    ffmpeg = require_tool("ffmpeg")
+    frames: Dict[str, Dict[str, int]] = {}
+    unmeasured: List[str] = []
+    for kind in kinds:
+        # 0:V is the motion picture only: an attached cover picture would be 0:v:0
+        sel = ["-map", "0:%s:0" % ("V" if kind == "video" else "a"), "-f", "framecrc", "-"]
+        base = [ffmpeg, "-hide_banner", "-nostdin", "-v", "error"]
+        origin = file_origin(meta)
+        # the head is the stream's own first window: sound that starts 2 s in has none in the file's
+        head_from = max(0.0, ((meta.get(kind) or {}).get("start_time") or origin) - origin)
+        head = run_analysis(base + ["-ss", "%.3f" % head_from, "-i", path, "-t", "%g" % window] + sel, check=False)
+        frames[kind] = {"head": _framecrc_frames(head) if head.returncode == 0 else 0}
+        # the stream's own end only: the container's is the longest stream's, and a shorter stream
+        # read there would decode nothing and be called undecodable when it is only unmeasured
+        end = stream_end(meta, kind)
+        if end is None:
+            frames[kind]["tail"] = 0
+            unmeasured.append(kind)
+            continue
+        tail_from = max(0.0, end - origin - window - DECODE_SEEK_MARGIN_SECONDS)  # -ss counts from the origin
+        # -copyts keeps the file's own timestamps, the timeline `end` is measured on
+        def tail_frames(start: float) -> int:
+            proc = run_analysis(base + ["-copyts", "-ss", "%.3f" % start, "-t", "%g" % (end - origin - start + 1.0), "-i", path]
+                                + sel, check=False)
+            return _framecrc_frames(proc, since=end - window) if proc.returncode == 0 else 0
+        frames[kind]["tail"] = tail_frames(tail_from)
+        if not frames[kind]["tail"] and tail_from > 0:
+            # a GOP longer than the margin (long-GOP MPEG-TS) has no keyframe after tail_from: read
+            # once more from up to DECODE_LONG_GOP_SECONDS earlier before calling it undecodable
+            # (bounded, so a failing hour-long stream is not decoded whole)
+            frames[kind]["tail"] = tail_frames(max(0.0, end - origin - window - DECODE_LONG_GOP_SECONDS))
+    bad = [k for k in kinds if not all(frames[k].values())]
+    step: Dict[str, Any] = {"step": "decode", "property": "decodable", "frames": frames, "window": window,
+                            "provenance": "measurement", "ok": not bad}
+    if bad:
+        step["undecodable"] = [k for k in bad if k not in unmeasured]
+    if unmeasured:
+        step["reason"] = "not_measured: no end time for the %s stream" % " and ".join(unmeasured)
+    return step
+
+
+def _framecrc_frames(proc: Any, since: Optional[float] = None) -> int:
+    """Frames in ffmpeg's framecrc output; with `since`, only those still on screen after that time
+    (pts plus duration past it: a last frame held for 2 s starts before the window and still
+    counts, one that ends exactly at it does not). Rows
+    are `stream, dts, pts, duration, size, crc`, timestamps in the `#tb N: num/den` time base."""
+    tb: Dict[str, float] = {}
+    n = 0
+    for line in (proc.stdout or "").splitlines():
+        if line.startswith("#tb "):
+            idx, frac = line[4:].split(":", 1)
+            num, den = frac.strip().split("/")
+            tb[idx.strip()] = float(num) / float(den)
+        elif line and not line.startswith("#"):
+            cols = [c.strip() for c in line.split(",")]
+            if since is None:
+                n += 1
+            elif len(cols) > 3 and cols[0] in tb and (float(cols[2]) + float(cols[3])) * tb[cols[0]] > since + 1e-6:
+                n += 1
+    return n
 
 
 def emit(output: Optional[str], *, ctx: "Optional[Context]" = None, **extra: Any) -> None:
@@ -432,9 +601,17 @@ def emit(output: Optional[str], *, ctx: "Optional[Context]" = None, **extra: Any
         # verified nothing. Spec failures the tool cannot fix on its own (export's loudness gap)
         # keep status completed and say verified: false, so a caller keys on one field.
         expect_streams = extra.pop("expect_streams", None)
+        stream_reference = extra.pop("stream_reference", None)
+        stream_windows = extra.pop("stream_windows", None)
         steps: List[Dict[str, Any]] = ([{"step": "probe", "ok": True}] if meta else []) + list(extra.pop("verification", None) or [])
         if meta and expect_streams:
             steps.append(stream_inventory_step(meta, expect_streams))
+            kept = [k for k in ("video", "audio") if _expected_count(expect_streams.get(k, 0))]
+            if stream_reference is not None and len(kept) == 2:
+                steps.append(stream_lengths_step(meta, stream_reference, windows=stream_windows))
+            present = [k for k in kept if meta.get(k)]
+            if present:
+                steps.append(decode_step(output, meta, present))
         # a tool that ran others (render.py) verified what its stages verified too (absorb_stage())
         steps += [s for s in ctx.stage_verification if s not in steps]
         if output and not ctx.dry_run and os.path.splitext(output)[1].lower() not in MEDIA_EXT:
