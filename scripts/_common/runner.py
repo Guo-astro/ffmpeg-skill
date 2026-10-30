@@ -118,7 +118,7 @@ def ffmpeg_version() -> "Tuple[int, int]":
     if _FFMPEG_VERSION is None:
         _FFMPEG_VERSION = (0, 0)
         try:
-            out = subprocess.run([ffmpeg_exe("ffprobe")[0] or "ffprobe", "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+            out = subprocess.run([found_exe("ffprobe"), "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
                                  timeout=PROBE_TIMEOUT).stdout
             m = re.search(r"ffprobe version\s+n?(\d+)\.(\d+)", out)
             if m:
@@ -155,7 +155,7 @@ def ffmpeg_release() -> "Optional[Tuple[int, int, int]]":
     if not _FFMPEG_RELEASE_READ:
         _FFMPEG_RELEASE_READ = True
         try:
-            out = subprocess.run([ffmpeg_exe("ffprobe")[0] or "ffprobe", "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+            out = subprocess.run([found_exe("ffprobe"), "-version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
                                  timeout=PROBE_TIMEOUT).stdout
             m = re.search(r"ffprobe version\s+n?(\d+)\.(\d+)(?:\.(\d+))?", out)
             if m:
@@ -187,21 +187,90 @@ def _homebrew_full_build(path: str, name: str) -> str:
     return full if os.path.isfile(full) and os.access(full, os.X_OK) else ""
 
 
+def _real_dir(path: str) -> str:
+    """`path` with symlinks resolved, so a PATH entry that links to the working directory is
+    recognised as the working directory."""
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _cwd_on_path(entries: List[str]) -> bool:
+    cwd = _real_dir(os.getcwd())
+    return any(e and os.path.isabs(e) and _real_dir(e) == cwd for e in entries)
+
+
+def _which_on_path(name: str, entries: List[str]) -> Optional[str]:
+    """The first `name` in an absolute PATH entry that is not the working directory."""
+    cwd = _real_dir(os.getcwd())
+    exts = [""]
+    if os.name == "nt" and not os.path.splitext(name)[1]:
+        exts = [e for e in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(os.pathsep) if e] + [""]
+    for entry in entries:
+        if not entry or not os.path.isabs(entry) or _real_dir(entry) == cwd:
+            continue
+        for ext in exts:
+            candidate = os.path.join(entry, name + ext)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+    return None
+
+
+def safe_which(name: str, which: Optional[Any] = None) -> Optional[str]:
+    """shutil.which() without the working directory. On Windows it looks in the current directory
+    before PATH (and so does a bare name handed to subprocess), and a `.` or relative PATH entry
+    does the same elsewhere: an `ffmpeg.exe` in a folder the skill is run from would run instead
+    of the real one. A hit there (or in a directory that links to it) is dropped and PATH searched
+    again, unless the working directory is on PATH as an absolute entry, which is the caller's own
+    choice. `which` lets a test pass
+    its own lookup."""
+    found = (which or shutil.which)(name)
+    if not found:
+        return found
+    entries = os.environ.get("PATH", "").split(os.pathsep)
+    if _real_dir(os.path.dirname(os.path.abspath(found))) != _real_dir(os.getcwd()):
+        return found
+    if _cwd_on_path(entries):
+        return os.path.abspath(found)  # Windows answers `.\ffmpeg.EXE`; a later chdir must not change what runs
+    return _which_on_path(name, entries)
+
+
+class SafeShutil:
+    """A shutil stand-in whose which() is safe_which(); the transcription code takes a `shutil`
+    argument (tests pass their own), so the real one is wrapped where it is handed in."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def which(self, name: str) -> Optional[str]:
+        return safe_which(name, self._inner.which)
+
+    def __getattr__(self, attr: str) -> Any:
+        return getattr(self._inner, attr)
+
+
 def ffmpeg_exe(name: str) -> Tuple[str, str]:
     """`(path, source)` of the ffmpeg/ffprobe the tools run; `("", "")` when none is on PATH.
 
     `source` is "path" (what PATH resolves) or "homebrew-ffmpeg-full" (see _homebrew_full_build).
     Not cached: PATH is read every time, as `shutil.which` was before this existed."""
-    found = shutil.which(name)
+    found = safe_which(name)
     if not found:
         return "", ""
     full = _homebrew_full_build(found, name)
     return (full, "homebrew-ffmpeg-full") if full else (found, "path")
 
 
+def found_exe(name: str) -> str:
+    """ffmpeg_exe()'s path, or FileNotFoundError when there is none: never the bare name, which
+    the OS would look up in the working directory (Windows) or through a relative PATH entry."""
+    path = ffmpeg_exe(name)[0]
+    if not path:
+        raise FileNotFoundError(f"{name} not on PATH")
+    return path
+
+
 def require_tool(name: str) -> str:
     """Return the absolute path of ffmpeg/ffprobe or exit with install steps."""
-    path = ffmpeg_exe(name)[0] if name in ("ffmpeg", "ffprobe") else shutil.which(name)
+    path = ffmpeg_exe(name)[0] if name in ("ffmpeg", "ffprobe") else safe_which(name)
     if path:
         return path
     system = platform.system()
@@ -991,7 +1060,7 @@ def apple_silicon() -> bool:
         _APPLE_SILICON = platform.machine() == "arm64"
         if not _APPLE_SILICON and platform.system() == "Darwin":
             try:
-                out = subprocess.run([shutil.which("sysctl") or "/usr/sbin/sysctl", "-n", "hw.optional.arm64"],
+                out = subprocess.run([safe_which("sysctl") or "/usr/sbin/sysctl", "-n", "hw.optional.arm64"],
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
                                      errors="replace", timeout=10).stdout
                 _APPLE_SILICON = out.strip() == "1"
@@ -1603,7 +1672,7 @@ def _read_ff_list(flag: str, pattern: str) -> set:
     names: set = set()
     why = None
     try:
-        proc = subprocess.run([ffmpeg_exe(tool)[0] or tool, "-hide_banner", flag], stdout=subprocess.PIPE,
+        proc = subprocess.run([found_exe(tool), "-hide_banner", flag], stdout=subprocess.PIPE,
                               stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", timeout=limit)
         names = set(re.findall(pattern, proc.stdout or "", re.M))
         if not names:

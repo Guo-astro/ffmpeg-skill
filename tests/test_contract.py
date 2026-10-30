@@ -3247,6 +3247,61 @@ class ContractTests(unittest.TestCase):
         warning = doc["diagnostics"]["warnings"][0]
         self.assertEqual((warning["code"], warning["paths"]), ("plan_unbound_inputs", [str(pending)]))
 
+    def test_a_program_in_the_working_directory_is_never_run_in_place_of_ffmpeg(self):
+        """On Windows, shutil.which() and a bare name given to subprocess look in the current
+        directory before PATH, so an ffmpeg.exe sitting in a folder the skill is run from would
+        run instead of the real one. A `.` (or relative) PATH entry does the same elsewhere, which
+        is how this is reproduced here. Every lookup skips the working directory unless it is on
+        PATH as an absolute entry."""
+        import importlib, stat
+        runner = importlib.import_module("_common.runner")
+        real = os.path.dirname(shutil.which("ffmpeg"))
+        trap = self.work / "trap"; trap.mkdir(exist_ok=True)
+        marker = trap / "PWNED"
+        for name in ("ffmpeg", "ffprobe", "fc-match", "fc-list", "whisper", "whisper-cli", "whisper-cpp", "main",
+                     "parakeet-mlx", "parakeet-cli"):
+            p = trap / (name + (".bat" if os.name == "nt" else ""))
+            p.write_text(("@echo off\r\necho x> PWNED\r\n" if os.name == "nt" else f"#!/bin/sh\n: > '{marker}'\nexit 1\n"),
+                         encoding="utf-8")
+            p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        old_cwd, old_path = os.getcwd(), os.environ.get("PATH", "")
+        try:
+            os.chdir(trap)
+            os.environ["PATH"] = os.pathsep.join([".", real])
+            self.assertEqual(os.path.dirname(runner.safe_which("ffmpeg")), real)
+            os.environ["PATH"] = "."
+            self.assertIsNone(runner.safe_which("ffmpeg"))
+            # with nothing found the version reads run nothing, not the bare name (which the OS
+            # would look up in the working directory)
+            saved = (runner._FFMPEG_VERSION, runner._FFMPEG_RELEASE, runner._FFMPEG_RELEASE_READ)
+            runner._FFMPEG_VERSION, runner._FFMPEG_RELEASE_READ = None, False
+            try:
+                runner.ffmpeg_version(); runner.ffmpeg_release()
+            finally:
+                runner._FFMPEG_VERSION, runner._FFMPEG_RELEASE, runner._FFMPEG_RELEASE_READ = saved
+            self.assertFalse(marker.exists(), "a version read ran the ffprobe in the working directory")
+            os.environ["PATH"] = os.pathsep.join([str(trap), real])  # on PATH as an absolute entry: a choice
+            hit = runner.safe_which("ffmpeg")
+            self.assertTrue(os.path.isabs(hit), hit)
+            self.assertEqual(os.path.normcase(os.path.realpath(os.path.dirname(hit))), os.path.normcase(os.path.realpath(trap)))
+            if os.name != "nt":  # a relative entry that links back to the working directory is still it
+                if not os.path.lexists("alias"):
+                    os.symlink(".", "alias")
+                os.environ["PATH"] = os.pathsep.join(["alias", real])
+                self.assertEqual(os.path.dirname(runner.safe_which("ffmpeg")), real)
+        finally:
+            os.chdir(old_cwd); os.environ["PATH"] = old_path
+        env = dict(os.environ, PATH=os.pathsep.join([".", real]))
+        src = shutil.copy(self.src, trap / "in.mp4")
+        for args in (["probe", "in.mp4", "--json"], ["fit", "in.mp4", "--aspect", "9:16", "-o", "out.mp4"],
+                     ["overlay", "in.mp4", "--text", "hi", "-o", "out2.mp4"]):
+            tool(*args, env=env, cwd=trap)
+        # both transcription entry points look every engine up (and launch it) by full path
+        for args in (["caption", "in.mp4", "--transcribe", "-o", "out3.mp4"],
+                     ["silence", "in.mp4", "--filler", "--transcribe", "-o", "out4.mp4"]):
+            tool(*args, env=env, cwd=trap, check=False)
+        self.assertFalse(marker.exists(), "a program in the working directory ran in place of the real tool")
+
     def test_a_url_never_reaches_ffmpeg_as_an_input_or_an_output(self):
         """The path guards read -o as a path, ffmpeg reads a value with a protocol prefix as a URL.
         The skill reads and writes local files only, so such an input or output is refused as
@@ -5121,7 +5176,7 @@ class SilentFallbackTests(unittest.TestCase):
         face.write_bytes(b"\0")
         answer = subprocess.CompletedProcess([], 0, f"{face}\nOther Sans,Other Sans Book\n", "")
         with mock.patch.object(fonts.platform, "system", return_value="Linux"), \
-                mock.patch.object(fonts.shutil, "which", return_value="/usr/bin/fc-match"), \
+                mock.patch.object(fonts, "_safe_which", return_value="/usr/bin/fc-match"), \
                 mock.patch.object(fonts.subprocess, "run", return_value=answer):
             got = fonts.resolve_font("Wanted Serif")
             same = fonts.resolve_font("Other Sans")
