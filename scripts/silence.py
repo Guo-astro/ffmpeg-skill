@@ -23,7 +23,7 @@ from _common import (filler_spans, FILLER_WORDS, FILLER_AMBIGUOUS, FILLER_DISCOU
                      FILLER_PAD, read_text_or_die)
 from _common import asr as _asr
 from _common.emit import warn
-from _common import refuse_existing_outputs, refuse_output_is_input, _check_output_path
+from _common import guard_sidecar, refuse_existing_outputs, refuse_output_is_input, _check_output_path
 from _common.emit import refuse
 from _common import detect_silences as detect, STATE, video_args, add_common, apply_common, audio_codec_for, cfr_args, default_output, die, emit, ffmpeg_base, info, is_audio_output, print_json, probe, run, X264_PRESETS, measured_level_dbfs, fmt_secs
 
@@ -464,13 +464,15 @@ def main() -> int:
         # directory at the path is a `kind: input` refusal, not a traceback from open()
         _check_output_path([args.timemap])
         # --overwrite allows replacing an old map, never the source, the cut or the EDL
-        refuse_output_is_input(args.timemap, *[p for p in (args.input, args.words) if p])
+        refuse_output_is_input(args.timemap, *[p for p in (args.input, args.words, args.filler_words) if p])
         for flag, other in (("-o", args.output), ("--edl", args.edl), ("--plan", getattr(args, "plan", None))):
             if other and os.path.realpath(other) == os.path.realpath(args.timemap):
                 refuse("input", "timemap_path_taken",
                        f"--timemap {args.timemap} is the same file as {flag}; give the map its own path",
                        timemap=args.timemap, flag=flag, path=other)
         refuse_existing_outputs([args.timemap])
+    media_out = None if (args.list or args.filler_list) else (args.output or default_output(args.input, "tight"))
+    guard_sidecar(args.edl, args.input, args.words, args.filler_words, siblings=(media_out,))
 
     if args.filler_pad < 0:
         die("--filler-pad cannot be negative: a negative pad turns each word's span inside out "

@@ -31,7 +31,7 @@ import math
 import sys
 from typing import Dict, List, Tuple
 
-from _common import label_chain, matrix_chain, video_args, aac_args, add_common, apply_common, default_output, die, emit, ffmpeg_base, info, time_arg, probe, run, x264_args, X264_PRESETS, fmt_secs, decode_pcm_mono, rms_envelope, STATE
+from _common import guard_sidecar, label_chain, matrix_chain, video_args, aac_args, add_common, apply_common, default_output, die, emit, ffmpeg_base, info, time_arg, probe, run, x264_args, X264_PRESETS, fmt_secs, decode_pcm_mono, rms_envelope, STATE
 from _common.emit import record_fallback, warn
 from sync import measure_offset
 
@@ -150,6 +150,12 @@ def main() -> int:
     add_common(ap)
     args = ap.parse_args()
     apply_common(args)
+    if not args.offsets_only:  # an offsets-only run writes nothing
+        media_out = args.output or default_output(args.inputs[0], "multicam", "mp4")
+        guard_sidecar(args.edl, *args.inputs, siblings=(args.write_project, media_out))
+        guard_sidecar(args.write_project, *args.inputs, siblings=(media_out,))
+        if args.edl or args.write_project:  # they are written before the cut: refuse its output first
+            guard_sidecar(media_out, *args.inputs)
     if args.analyze_seconds > 900:
         die(f"--analyze-seconds {args.analyze_seconds:g}: the window is decoded into memory; 900 s is the ceiling")
     if args.fps is not None and args.fps <= 0:
