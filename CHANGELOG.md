@@ -6,6 +6,12 @@
 
 (nothing yet)
 
+## 2.22.3
+
+_Automated release: version and notes generated from pull requests merged since 2.22.2._
+
+- Enable the Trail of Bits security review plugins for this repository (#381)
+
 ## 2.22.2
 
 _Automated release: version and notes generated from pull requests merged since 2.22.1._
