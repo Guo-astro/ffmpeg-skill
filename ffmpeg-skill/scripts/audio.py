@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from _common.probe import SILENT_PEAK_DBFS
+from _common.runner import path_denied
 from _common import STATE, add_common, dry_run_input_pending, require_tool, apply_common, audio_codec_for, db_to_linear, default_output, die, emit, ffmpeg_base, info, is_audio_output, measured_level_dbfs, probe, run, run_keeping_subtitles, fmt_secs
 from _common.emit import file_origin, stream_end, warn
 from _common.decision import LOSSLESS_AUDIO_EXT, PAD_SOUND_FROM_ZERO, atempo_chain_with_lead, conform_filter, conform_to_length, late_sound_lead
@@ -168,8 +169,8 @@ def preflight_beds(args: argparse.Namespace) -> List[Dict[str, Any]]:
         if dry_run_input_pending(path):
             continue
         reason = None
-        if not os.path.exists(path):
-            reason = "missing"
+        if path_denied(path) or not os.path.exists(path):
+            reason = "permission denied" if path_denied(path) else "missing"
         elif os.path.isdir(path):
             reason = "a directory, not a file"
         elif os.path.getsize(path) == 0:
@@ -395,7 +396,7 @@ def main() -> int:
     ap.add_argument("--audio-stream", type=int, default=0, help="which audio stream of the input to process, 0-based in file order (probe lists them under audio_streams)")
     ap.add_argument("--bitrate", default=None,
                     help="audio bitrate: AAC's beside a picture (default 192k), and the codec's of a lossy audio output "
-                         "(.m4a/.aac default 256k, .mp3 -q:a 0, .ogg -q:a 6, .opus 128k); refused for .wav/.flac/.aif/.aiff/.caf")
+                         "(.m4a/.aac default 256k, .mp3 -q:a 0, .ogg -q:a 6, .opus 128k); refused for .wav/.flac/.aif/.aiff/.caf/.mka")
     ap.add_argument("--on-silent", choices=["warn", "fail"], default="warn",
                     help="a --music/--replace/--effects file (or, under --duck, the voice) whose peak is at or below "
                          "--silence-threshold: warn (default: mix it, report it under `silent`) or fail (refuse before ffmpeg runs)")

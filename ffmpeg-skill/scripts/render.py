@@ -75,7 +75,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from export import PRESETS, PLATFORM_OF
 from _platforms import PLATFORMS, caption_defaults, resolve as resolve_platform
 from _common import AUDIO_CODECS, guard_sidecar, STATE, add_common, aspect_ratio, display_size, frame_size, brand_caption_style, load_brand, apply_common, child_args, die, emit as _emit, info, option_args, probe, require_tool, run, run_tool, place_output, refuse_output_is_input, refuse_unwritten_output, _check_existing_output, _check_output_path, fingerprint, PLAN_VERSION, ffmpeg_version, X264_PRESETS
-from _common.runner import HW_ENV, HW_FORCED_ENV, add_hw_orchestrator_args, child_exit_code, found_exe, kept_clause, kept_deliverables, mark_delivered, owned_identity, read_json, refuse_missing_components_first, remember_written, with_flags, kept_output, unwatch_destination, watch_destination
+from _common.runner import absent_word, path_denied, HW_ENV, HW_FORCED_ENV, add_hw_orchestrator_args, child_exit_code, found_exe, kept_clause, kept_deliverables, mark_delivered, owned_identity, read_json, refuse_missing_components_first, remember_written, with_flags, kept_output, unwatch_destination, watch_destination
 from _common.emit import absorb_stage, audit, is_output_shape_flag, record_fallback, record_skip, refuse, stderr_records, warn
 from _common.decision import brand_asset_files, rebase_project_paths
 from _common.probe import AUDIO_MEDIA_EXT
@@ -275,7 +275,7 @@ def template_project(name: str, args) -> Dict[str, Any]:
     for flag, path in (("--cues", args.cues), ("--srt", args.srt), ("--logo", args.logo),
                        ("--brand", args.brand), ("--chapters", args.chapters), ("--image", args.image)):
         if path and not os.path.isfile(path):
-            die(f"{flag}: file not found: {path}")
+            die(f"{flag}: file {absent_word(path)}: {path}")
     audiogram = tpl.get("audiogram")
     if isinstance(audiogram, dict) and "$IMAGE" in audiogram.values() and not args.image and not args.write_project:
         # A89: without --image the whole audiogram block was dropped as an unfilled placeholder,
@@ -781,12 +781,11 @@ def sh(script: str, *argv: Any, extra: List[str] = None, stage: str = None) -> s
         key_args = ["<out>" if a == dest else a for a in full]
         key_files = {a for a in key_args if os.path.exists(a)}  # the files the key hashes, again at the store
         key = cache_key(stage, script, key_args, inputs, dest, key_files)
+        _LAST_DOC.clear()
         if cache_lookup(stage, key, dest, Path(script).stem):
             CACHE["hits"].append(stage)
             info(f"→ {script} {stage}: served from --cache")
-            # No child ran, so there is no document: say so rather than leaving the PREVIOUS
-            # child's document standing, which a caller reading _LAST_DOC would misattribute.
-            _LAST_DOC.clear()
+            # No child ran; the sidecar carries only the recorded fields we can replay.
             _LAST_DOC["cached"] = True
             if not STATE.dry_run:
                 remember_written(dest)  # placed by this run, as a stage's own write would be (#415)
@@ -1130,6 +1129,8 @@ def cache_lookup(stage: str, key: str, dest: str, tool: Optional[str] = None) ->
     PROJECT_SOURCE["timecode"].append(_timecode_verdict(result) if isinstance(result, dict) and "source_carry" in result
                                       else "unknown")
     if isinstance(result, dict):
+        if isinstance(result.get("picture"), dict):
+            _LAST_DOC["picture"] = result["picture"]
         absorb_stage(tool or stage, dict(result, status="completed", dry_run=False))  # tagged as the stage's tool, as a live run is
     else:
         # an entry written before the stage's result was kept: what the stage verified is unknown
@@ -1142,7 +1143,7 @@ def _stage_result(doc: Any) -> Dict[str, Any]:
     """What a cache entry keeps of the stage's own --json document, replayed on a hit."""
     if not isinstance(doc, dict):
         return {}
-    kept = {k: doc[k] for k in ("verified", "verification", "notes", "diagnostics") if k in doc}
+    kept = {k: doc[k] for k in ("verified", "verification", "notes", "diagnostics", "picture") if k in doc}
     kept["source_carry"] = doc.get("source_carry")  # None too: the stage compared nothing (render's source_carry)
     return kept
 
@@ -1433,7 +1434,7 @@ def export_timeline(proj: Dict[str, Any], rel, dest: str) -> int:
         if path in probes:
             continue  # one ffprobe per file: ten clips of one recording are one probe (A267)
         if not os.path.exists(path):
-            die(f"timeline source not found: {path}")
+            die(f"timeline source {absent_word(path)}: {path}")
         probes[path] = probe(path)  # a timeline needs real durations and rates, dry run or not
     # the sequence frame is the one the render would deliver: an aspect-only frame takes its size
     # from the export preset exactly as the render's own frame does. An export that is not an
@@ -1680,7 +1681,7 @@ def main() -> int:
         # `render.py --template tiktok talk.mp4 ...`: the positional is the footage, not a project.
         args.input = args.project
         if not os.path.isfile(args.input):
-            die(f"input not found: {args.input}")
+            die(f"input {absent_word(args.input)}: {args.input}")
         names = expand_templates(args.template)
         if len(names) > 1:
             if args.write_project:
@@ -1741,7 +1742,7 @@ def main() -> int:
         return p if os.path.isabs(p) else str(base / p)
 
     if isinstance(proj.get("chapters"), str) and not os.path.exists(rel(proj["chapters"])):
-        die(f"chapters file not found: {rel(proj['chapters'])}")
+        die(f"chapters file {absent_word(rel(proj['chapters']))}: {rel(proj['chapters'])}")
 
     if args.export_timeline:
         return export_timeline(proj, rel, args.export_timeline)
@@ -1765,7 +1766,7 @@ def main() -> int:
                 layer = rel(ov["video"])
                 refuse_output_is_input(output, layer)
                 if not os.path.isfile(layer):
-                    die(f"overlays[{i}].video: file not found: {layer}", kind="input")
+                    die(f"overlays[{i}].video: file {absent_word(layer)}: {layer}", kind="input")
     # 2.0 refuses an existing output without --overwrite; the final place_output() would, but
     # only after every stage had run -- say so before the first one instead
     _check_existing_output(["ffmpeg", output])
@@ -1863,6 +1864,8 @@ def main() -> int:
     # what the caption stage reported (wrapped/split counts and the fit-size keys), so a caller
     # reading render.py's JSON can see whether the type was shrunk to fit or a cue was split.
     caption_report: Optional[Dict[str, Any]] = None
+    stage_pictures: Dict[str, Any] = {}
+    picture_fields: Dict[str, Any] = {}
 
     CACHE.clear()
     CACHE.update(_fresh_cache())
@@ -1900,8 +1903,8 @@ def main() -> int:
     problems: List[Dict[str, Any]] = []
     for i, c in enumerate(clips):
         src = rel(c["src"])
-        if not os.path.exists(src):  # under --dry-run too: a plan for a missing file is no plan
-            problems.append({"index": i, "path": src, "reason": "missing"})
+        if path_denied(src) or not os.path.exists(src):  # under --dry-run too: a plan for a missing file is no plan
+            problems.append({"index": i, "path": src, "reason": "permission denied" if path_denied(src) else "missing"})
         elif os.path.isdir(src):
             problems.append({"index": i, "path": src, "reason": "a directory, not a file"})
         elif os.path.getsize(src) == 0:
@@ -1962,7 +1965,7 @@ def main() -> int:
             if abs(spd - 1.0) > 1e-6:  # speed 1.0 used to cost a full re-encode for nothing
                 dur = (probe(part).get("duration") or 0.0) if not STATE.dry_run else planned_clip_length(c, src, i)
                 fitted = str(work / f"clip{i:02d}_speed{mid}")
-                sh("fit.py", part, "--duration", f"{dur / spd:.3f}", "-o", fitted, stage="clips")
+                sh("fit.py", part, "--duration", f"{dur / spd:.3f}", "--method", "speed", "-o", fitted, stage="clips")
                 part = fitted
         parts.append(part)
     stages_done.append("clips")
@@ -2103,10 +2106,13 @@ def main() -> int:
             if fit.get(k) is not None:
                 argv += option_args(flag, fit[k])
         sh("fit.py", *argv, stage="fit")
+        if isinstance(_LAST_DOC.get("picture"), dict):
+            stage_pictures["fit"] = _LAST_DOC["picture"]
+            picture_fields.update(picture=stage_pictures["fit"], stage_pictures=stage_pictures)
         current = nxt
         stages_done.append("fit")
     if args.stop_after == "fit":
-        emit(current, stages=stages_done, intermediate_preset=_intermediate_used())
+        emit(current, stages=stages_done, intermediate_preset=_intermediate_used(), **picture_fields)
         return 0
 
     # ---- captions
@@ -2138,7 +2144,7 @@ def main() -> int:
         current = nxt
         stages_done.append("captions")
     if args.stop_after == "captions":
-        emit(current, stages=stages_done, intermediate_preset=_intermediate_used())
+        emit(current, stages=stages_done, intermediate_preset=_intermediate_used(), **picture_fields)
         return 0
 
     # ---- graphics
@@ -2157,7 +2163,7 @@ def main() -> int:
         if "graphics" not in stages_done:
             stages_done.append("graphics")
     if args.stop_after == "graphics":
-        emit(current, stages=stages_done, intermediate_preset=_intermediate_used())
+        emit(current, stages=stages_done, intermediate_preset=_intermediate_used(), **picture_fields)
         return 0
 
     # ---- overlays
@@ -2189,7 +2195,7 @@ def main() -> int:
         if "overlays" not in stages_done:
             stages_done.append("overlays")
     if args.stop_after == "overlays":
-        emit(current, stages=stages_done, intermediate_preset=_intermediate_used())
+        emit(current, stages=stages_done, intermediate_preset=_intermediate_used(), **picture_fields)
         return 0
 
     # ---- audio
@@ -2226,7 +2232,7 @@ def main() -> int:
         current = nxt
         stages_done.append("audio")
     if args.stop_after == "audio":
-        emit(current, stages=stages_done, intermediate_preset=_intermediate_used())
+        emit(current, stages=stages_done, intermediate_preset=_intermediate_used(), **picture_fields)
         return 0
 
     # ---- loudness
@@ -2247,7 +2253,7 @@ def main() -> int:
         current = nxt
         stages_done.append("loudness")
     if args.stop_after == "loudness":
-        emit(current, stages=stages_done, intermediate_preset=_intermediate_used())
+        emit(current, stages=stages_done, intermediate_preset=_intermediate_used(), **picture_fields)
         return 0
 
     # ---- export
@@ -2259,7 +2265,7 @@ def main() -> int:
         if ex.get("crf") is not None:
             argv += option_args("--crf", ex["crf"])
         normalize = ex.get("normalize")
-        if normalize is None and ex["preset"] in PLATFORM_OF and not proj.get("loudness"):
+        if normalize is None and resolve_platform(ex["preset"]) in PLATFORM_OF and not proj.get("loudness"):
             # eval 8: a reels project without the key rendered fully, failed the loudness check and
             # was rendered again; a platform preset with no loudness stage of its own gets the
             # one-export behaviour by default ("normalize": false opts out)
@@ -2268,7 +2274,19 @@ def main() -> int:
                  "normalize_on_by_default", preset=ex["preset"])
         if normalize:
             argv += ["--normalize"]  # one export that meets the platform's loudness (export.py --normalize)
+        elif resolve_platform(ex["preset"]) in PLATFORM_OF:  # an alias (youtube-shorts) too
+            # export.py normalises a platform preset by default since 4.0.0 (#579): an opt-out, or a
+            # loudness stage of the project's own, has to say so or its level is overwritten
+            argv += ["--no-normalize"]
         sh("export.py", *argv, stage="export")
+        preset = PRESETS.get(ex["preset"]) or PRESETS[resolve_platform(ex["preset"])]
+        if preset["w"]:
+            # An older cached export (or a width-only preset) can resize without a report.
+            # Keep the fit-stage report, but never claim it measures that delivery.
+            picture_fields.pop("picture", None)
+            if isinstance(_LAST_DOC.get("picture"), dict):
+                stage_pictures["export"] = _LAST_DOC["picture"]
+                picture_fields.update(picture=stage_pictures["export"], stage_pictures=stage_pictures)
         stages_done.append("export")
     else:
         if stages_done != ["clips"]:
@@ -2299,7 +2317,7 @@ def main() -> int:
         if not args.keep and not args.work:
             shutil.rmtree(work, ignore_errors=True)
         emit(output, stages=stages_done, check=None, cache=cache_report(args.cache),
-             intermediate_preset=_intermediate_used(), caption_srt=caption_srt)
+             intermediate_preset=_intermediate_used(), caption_srt=caption_srt, **picture_fields)
         return 0
 
     # ---- chapters (metadata.py on the delivered file: streams copied, markers written)
@@ -2392,7 +2410,8 @@ def main() -> int:
         snap_report["clips"] = snap_reports
     emit(output, stages=stages_done, check=check_result, snap=snap_report, cache=cache_report(args.cache),
          caption=caption_report, intermediate_preset=_intermediate_used(), caption_srt=caption_srt,
-         verification=[{"step": "check", "ok": True, "platform": ck.get("platform")}] if check_result else [])
+         verification=[{"step": "check", "ok": True, "platform": ck.get("platform")}] if check_result else [],
+         **picture_fields)
     return 0
 
 
